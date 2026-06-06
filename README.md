@@ -8,6 +8,17 @@ Left to right: original · Standard synthetic · OpenVINO MiDaS v2.1 Small · Op
 
 ---
 
+> [!IMPORTANT]
+> **AI model weights are not included in the repository** (files exceed GitHub's 100 MB limit).  
+> After cloning, download them with a single command:
+> ```bash
+> python download_models.py
+> ```
+> Models are hosted as assets of the [latest GitHub Release](https://github.com/GrzegorzOle/DepthForge/releases/latest) (~685 MB total).  
+> Without the models the program falls back to the **synthetic method only** (no AI depth estimation).
+
+---
+
 ## Purpose
 
 DepthForge analyses a flat 2D image and reconstructs the **depth (spatial) information** hidden within it — estimating which parts of the scene are close and which are distant.  

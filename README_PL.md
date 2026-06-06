@@ -8,6 +8,17 @@ Od lewej: oryginał · Standard syntetyczny · OpenVINO MiDaS v2.1 Small · Open
 
 ---
 
+> [!IMPORTANT]
+> **Wagi modeli AI nie są przechowywane w repozytorium** (pliki przekraczają limit 100 MB narzucony przez GitHub).  
+> Po sklonowaniu pobierz je jednym poleceniem:
+> ```bash
+> python download_models.py
+> ```
+> Modele są dostępne jako załączniki do [najnowszego GitHub Release](https://github.com/GrzegorzOle/DepthForge/releases/latest) (łącznie ~685 MB).  
+> Bez modeli program działa wyłącznie w trybie **syntetycznym** (bez estymacji głębi przez AI).
+
+---
+
 ## Przeznaczenie
 
 DepthForge analizuje płaski obraz 2D i rekonstruuje ukrytą w nim **informację o głębi (przestrzeni)** — szacując, które fragmenty sceny są bliskie, a które odległe.  
