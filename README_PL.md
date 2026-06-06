@@ -50,7 +50,7 @@ Projekt umożliwia przetwarzanie obrazów muzealnych w celu wygenerowania map g�
 
 ```bash
 # Sklonuj repozytorium
-git clone <repo_url>
+git clone https://github.com/GrzegorzOle/DepthForge.git
 cd DepthForge
 
 # Utwórz środowisko wirtualne
@@ -59,6 +59,26 @@ source .venv/bin/activate
 
 # Zainstaluj wymagane biblioteki
 pip install -r requirements.txt
+
+# Pobierz modele OpenVINO (DPT Large + MiDaS v2.1 Small)
+python download_models.py
+```
+
+> **Uwaga:** Pliki wag modeli nie są przechowywane w repozytorium (przekraczają limit 100 MB narzucony przez GitHub).  
+> Są dystrybuowane jako załączniki do [GitHub Release](https://github.com/GrzegorzOle/DepthForge/releases/latest).  
+> Skrypt `download_models.py` pobiera je automatycznie.
+
+### Ręczne pobieranie modeli (opcjonalne)
+
+```bash
+# Pobierz tylko model DPT Large
+python download_models.py --model dpt
+
+# Pobierz tylko MiDaS
+python download_models.py --model midas
+
+# Wskaż konkretne wydanie
+python download_models.py --release v0.1.0
 ```
 
 ## Użycie
