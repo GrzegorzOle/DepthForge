@@ -1,0 +1,47 @@
+{
+    "project": {
+        "name": "DepthForge",
+        "version": "0.1.0",
+        "description": "Depth map generation for museum images to create 3D tactile visualizations for the visually impaired"
+    },
+    "directories": {
+        "src": "./src",
+        "data": "./data",
+        "models": "./models",
+        "output": "./output"
+    },
+    "model": {
+        "yolo": {
+            "version": "yolov8",
+            "size": "n",
+            "confidence_threshold": 0.5,
+            "iou_threshold": 0.4
+        },
+        "depth_estimation": {
+            "method": "openvino",
+            "backend": "midas",
+            "midas_model_path": "./models/midas/openvino/midas_v21_small_256.xml",
+            "dpt_model_path": "./models/dpt/openvino/dpt_large.xml",
+            "device": "CPU",
+            "use_openvino": true
+        }
+    },
+    "processing": {
+        "input_format": "*.jpg,*.jpeg,*.png,*.bmp",
+        "output_format": "png",
+        "resize_input": false,
+        "resize_width": 640,
+        "resize_height": 480,
+        "enhancement": {
+            "clahe_clip_limit": 2.0,
+            "clahe_tile_size": [8, 8],
+            "morphology_kernel_size": [3, 3]
+        }
+    },
+    "tactile": {
+        "output_format": "png",
+        "bit_depth": 8,
+        "range_min": 0,
+        "range_max": 255
+    }
+}

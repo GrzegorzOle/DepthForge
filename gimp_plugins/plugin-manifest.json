@@ -1,0 +1,13 @@
+{
+    "name": "DepthForge GIMP Plugin",
+    "version": "0.1.0",
+    "author": "DepthForge Team",
+    "description": "DepthForge plugin for GIMP to generate depth maps",
+    "license": "MIT",
+    "website": "https://github.com/depthforge/depthforge",
+    "dependencies": [
+        "python3",
+        "opencv-python",
+        "numpy"
+    ]
+}
