@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 """
 DepthForge – Model downloader
 Downloads pre-converted OpenVINO IR models from GitHub Releases.

@@ -100,7 +100,7 @@ python download_models.py --release v0.1.0
 python src/depth_forge.py --input input_image.jpg --output output_depth.png --enhanced-output enhanced_depth.png --tactile-output tactile_map.png
 ```
 
-### Full pipeline (depth maps + STL for 3D printing)
+### Full pipeline depth maps + STL (demo - waiting for correct project off Kuba for 3D printing)
 
 ```bash
 python src/depth_pipeline.py --input data/Stańczyk.jpg --output-dir output/stanczyk --width-mm 200 --relief-mm 12
