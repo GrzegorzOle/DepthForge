@@ -24,8 +24,8 @@ from depth_forge import DepthForge
 IMAGES = [
     "data/sample_input.jpg",
     "data/museum_sample_input.jpg",
-    "data/Jozef_Chełmonski_-_Indian_summer_-_Google_Art_Project.jpg",
-    "data/Stańczyk.jpg",
+    "data/Indian_summer_-_Google_Art_Project.jpg",
+    "data/Stanczyk.jpg",
 ]
 RUNS = 3  # how many times to run each method (for reliable timing)
 
@@ -109,6 +109,12 @@ def build_ensemble(depth_results: dict) -> np.ndarray:
 
 # ── Comparison grid ───────────────────────────────────────────────────────────
 
+def imread_unicode(path: str) -> np.ndarray:
+    """Reads an image file supporting Unicode/non-ASCII paths on Windows."""
+    buf = np.frombuffer(open(path, "rb").read(), dtype=np.uint8)
+    return cv2.imdecode(buf, cv2.IMREAD_COLOR)
+
+
 def save_comparison_grid(image_path: str, results: dict,
                          ensemble: np.ndarray, out_dir: Path):
     """
@@ -116,7 +122,7 @@ def save_comparison_grid(image_path: str, results: dict,
       original | standard | midas | dpt | ensemble
     laid out in a 2-column layout.
     """
-    orig = cv2.imread(image_path)
+    orig = imread_unicode(image_path)
     if orig is None:
         return None
 
@@ -211,7 +217,10 @@ def run_benchmark():
             print(f"{YELLOW}  Skipped (file not found): {img_path}{RESET}\n")
             continue
 
-        image = cv2.imread(img_path)
+        image = imread_unicode(img_path)
+        if image is None:
+            print(f"{RED}  Błąd odczytu pliku: {img_path}{RESET}\n")
+            continue
         h, w  = image.shape[:2]
         stem  = Path(img_path).stem
 

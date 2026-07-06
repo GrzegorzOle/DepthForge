@@ -19,7 +19,13 @@ from pathlib import Path
 import argparse
 from typing import Dict, Optional
 import logging
-import torch
+
+try:
+    import torch
+    _TORCH_AVAILABLE = True
+except ImportError:
+    torch = None  # type: ignore[assignment]
+    _TORCH_AVAILABLE = False
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -35,8 +41,12 @@ class DepthForge:
         """
         self.config = self._load_config(config_path)
         self._setup_directories()
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info(f"Using device: {self.device}")
+        if _TORCH_AVAILABLE:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            logger.info(f"Using device: {self.device}")
+        else:
+            self.device = "cpu"
+            logger.info("PyTorch not available – using OpenVINO/CPU pipeline only")
         
         # Initialize OpenVINO if available
         self.ov_core = None
@@ -81,7 +91,9 @@ class DepthForge:
         Returns:
             Loaded image as numpy array
         """
-        image = cv2.imread(image_path)
+        # Use frombuffer + imdecode to handle Unicode/non-ASCII paths on Windows
+        buf = np.frombuffer(open(image_path, "rb").read(), dtype=np.uint8)
+        image = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         if image is None:
             raise ValueError(f"Could not load image from {image_path}")
         return image
@@ -279,6 +291,50 @@ class DepthForge:
         # Resize back to original image size
         depth_resized = cv2.resize(depth_norm, (orig_w, orig_h), interpolation=cv2.INTER_LANCZOS4)
 
+        return depth_resized
+
+    def _run_openvino_inference_f32(self, compiled_model, image: np.ndarray,
+                                    model_name: str) -> np.ndarray:
+        """
+        Runs inference and returns a raw float32 disparity map (NOT normalized to uint8).
+        Used by the scale-shift alignment fusion pipeline.
+
+        Args:
+            compiled_model: Compiled OpenVINO model
+            image: Input image (BGR, uint8)
+            model_name: 'midas' or 'dpt'
+
+        Returns:
+            Raw depth/disparity map (float32) at the input image resolution.
+        """
+        input_shape = compiled_model.input(0).shape
+        if len(input_shape) == 4:
+            _, _, h, w = input_shape
+        else:
+            h, w = 256, 256
+
+        orig_h, orig_w = image.shape[:2]
+
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        resized = cv2.resize(rgb, (int(w), int(h)), interpolation=cv2.INTER_LANCZOS4)
+
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        tensor = (resized.astype(np.float32) / 255.0 - mean) / std
+        tensor = np.transpose(tensor, (2, 0, 1))[np.newaxis, ...]
+
+        result    = compiled_model([tensor])
+        depth_raw = result[compiled_model.output(0)]
+
+        if depth_raw.ndim == 4:
+            depth_raw = depth_raw[0, 0]
+        elif depth_raw.ndim == 3:
+            depth_raw = depth_raw[0]
+
+        # Return raw float32 — no quantisation, full precision for MWK alignment
+        depth_f32 = depth_raw.astype(np.float32)
+        depth_resized = cv2.resize(depth_f32, (orig_w, orig_h),
+                                   interpolation=cv2.INTER_LANCZOS4)
         return depth_resized
 
     def enhance_depth_map(self, depth_map: np.ndarray) -> np.ndarray:
