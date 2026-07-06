@@ -35,22 +35,12 @@ Proces przebiega dwuetapowo:
 
 ---
 
-## Opis
-
-DepthForge to narzędzie do generowania map głębokości z obrazów muzealnych, przeznaczone do tworzenia dotykowych wizualizacji 3D dla osób niewidomych.
-
-Projekt umożliwia przetwarzanie obrazów muzealnych w celu wygenerowania map głębokości, które mogą być wykorzystane do tworzenia dotykowych map 3D dla osób niewidomych. Wykorzystuje:
-- OpenCV do operacji na obrazach
-- OpenVINO do efektywnego przetwarzania modeli ML
-- PyTorch do analizy obrazów
-- Specjalistyczne algorytmy do lepszego wizualizowania głębokości
-
 ## Wymagania
 
 - Python 3.8+
-- OpenCV
+- OpenCV (opencv-contrib-python)
 - OpenVINO
-- PyTorch
+- PyTorch + torchvision
 - NumPy
 - SciPy
 - Scikit-image
@@ -66,7 +56,8 @@ cd DepthForge
 
 # Utwórz środowisko wirtualne
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate      # Linux/macOS
+.venv\Scripts\activate         # Windows
 
 # Zainstaluj wymagane biblioteki
 pip install -r requirements.txt
@@ -82,28 +73,37 @@ python download_models.py
 ### Ręczne pobieranie modeli (opcjonalne)
 
 ```bash
-# Pobierz tylko model DPT Large
-python download_models.py --model dpt
-
-# Pobierz tylko MiDaS
-python download_models.py --model midas
-
-# Wskaż konkretne wydanie
-python download_models.py --release v0.1.0
+python download_models.py --model dpt      # tylko DPT Large
+python download_models.py --model midas    # tylko MiDaS v2.1 Small
+python download_models.py --release v0.1.0 # konkretne wydanie
 ```
+
+---
 
 ## Użycie
 
-### Jedno zdjęcie
+### Pipeline wizualny — mapy głębokości + STL
 
 ```bash
-python src/depth_forge.py --input input_image.jpg --output output_depth.png --enhanced-output enhanced_depth.png --tactile-output tactile_map.png
+python src/depth_pipeline.py --input data/Stanczyk.jpg \
+    --output-dir output/stanczyk \
+    --width-mm 200 --relief-mm 12
 ```
 
-### Pełny pipeline (mapy głębokości + STL (to takie demo czekamy na właściwy projskt naszgo specjalizty Kuby - druk 3D)
+### Pipeline taktylny — zoptymalizowany do odczytu dotykiem (druk tyflograficzny)
 
 ```bash
-python src/depth_pipeline.py --input data/Stańczyk.jpg --output-dir output/stanczyk --width-mm 200 --relief-mm 12
+python src/depth_pipeline.py \
+    --input data/Indian_summer_-_Google_Art_Project.jpg \
+    --output-dir output/indian_summer_tactile \
+    --tactile \
+    --tactile-multiscale \
+    --tactile-fine-sigma 1.5 \
+    --tactile-limb-sigma 3.0 \
+    --detail-strength 0.05 \
+    --detail-blur-sigma 2.5 \
+    --fill-holes \
+    --width-mm 200 --relief-mm 7 --mesh-px 200
 ```
 
 ### Przetwarzanie wsadowe
@@ -118,66 +118,195 @@ python src/depth_forge.py --batch --input-dir data/ --output-dir output/
 python benchmark.py
 ```
 
-## Funkcjonalności specyficzne dla muzeów
+---
 
-- Generowanie map głębokości dla obrazów muzealnych
-- Optymalizacja dla wizualizacji 3D
-- Wsparcie dla druku 3D (mapy dotykowe) — eksport binarny STL
-- Współpraca z systemami brajla i wizualizacji 3D
+## Przegląd pipeline'u
 
-## Wersje map głębokości
+```
+Obraz wejściowy
+    │
+    ├─► Syntetyczna mapa głębokości (Standard)
+    ├─► OpenVINO MiDaS v2.1 Small
+    └─► OpenVINO DPT Large
+            │
+            ▼
+    Fuzja ensemble ze skalowaniem skali (DPT×0.50 + MiDaS×0.35 + Standard×0.15)
+    Filtr guided (self-guided, zachowujący krawędzie)
+            │
+            ├─[--fill-holes]──► fill_small_object_holes()
+            │                   Wypełnia płaskie wnętrza małych obiektów
+            │                   (zwierzęta, dalekie postacie) niewykrytych przez modele
+            │
+    ┌───────┴──────────────────────────────────────────────┐
+    │  Tryb WIZUALNY (domyślny)   Tryb TAKTYLNY (--tactile)    │
+    │                                                      │
+    │  apply_detail_overlay()     [--detail-strength > 0]      │
+    │  Nakłada mikroteksturę      apply_detail_overlay() PRZED │
+    │  z luminancji obrazu        wygładzaniem — przywraca     │
+    │                             kontury kończyn z cieni      │
+    │                                                      │
+    │  postprocess_depth()        prepare_for_touch() lub      │
+    │  CLAHE + łagodny Gauss      prepare_for_touch_multiscale()│
+    │                             Usuwa drobny szum tkaniny,   │
+    │                             zachowuje kontury kończyn    │
+    │                                                      │
+    │                             [--tactile-levels > 1]       │
+    │                             quantize_depth_foreground_aware()│
+    │                             Asymetryczna kwantyzacja:    │
+    │                             bg_levels dla nieba/ziemi,   │
+    │                             fg_levels dla postaci        │
+    │                                                      │
+    │                             smooth_quantized_boundaries()│
+    │                             Morfologiczne domknięcie/    │
+    │                             otwarcie na maskach poziomów │
+    │                             — eliminuje staircase noise  │
+    └──────────────────────────────────────────────────────┘
+            │
+            ▼
+    depth_to_stl()  →  binarny plik STL (watertight, gotowy dla Prusa Slicer)
+```
 
-Projekt generuje trzy różne wersje mapy głębokości:
-1. **Podstawowa mapa głębokości** — wygenerowana na podstawie intensywności obrazu
-2. **Ulepszona mapa głębokości** — zastosowane techniki kontrastu (CLAHE)
-3. **Mapa dotykowa** — optymalizowana do druku 3D dla osób niewidomych
+---
 
-## Integracja z OpenVINO
+## Tryb taktylny — kompletny opis parametrów
 
-Ten projekt został zaprojektowany z myślą o integracji z OpenVINO w celu poprawy estymacji głębokości:
-- Wsparcie dla modeli MiDaS i DPT
-- Efektywne wnioskowanie na CPU/GPU
-- Integracja z procesami druku 3D
+Tryb taktylny (`--tactile`) jest zaprojektowany dla wydruków 3D, które będą **odczytywane dotykiem**, zgodnie z muzealnymi standardami tyflograficznymi (RNIB, Museo del Prado).
+
+### Wygładzanie
+
+| Flaga | Domyślnie | Opis |
+|---|---|---|
+| `--tactile-median` | `5` | Rozmiar filtra medianowego [px] — usuwa outliery szpilkowe przed Gaussem |
+| `--tactile-sigma` | `3.5` | σ Gaussa [px] dla jednoprzebiegowego wygładzania (gdy `--tactile-multiscale` wyłączone) |
+| `--tactile-multiscale` | wył. | **Wygładzanie wieloskalowe** — osobne usuwanie drobnej tekstury (tkanina, trawa) i zachowanie konturów kończyn (nogi, ręce) |
+| `--tactile-fine-sigma` | `1.5` | σ [px] dla usuwania drobnej tekstury (zalecane 1.2–1.5) |
+| `--tactile-limb-sigma` | `3.0` | σ [px] definiujący skalę kończyn; filtr końcowy używa `limb_sigma × 0.5`, by nie zlać sąsiednich nóg (zalecane 2.5–3.5) |
+
+### Nakładka mikrodetalu w trybie taktylnym
+
+W trybie taktylnym `--detail-strength > 0` uruchamia `apply_detail_overlay()` **przed** wygładzaniem.  
+Przywraca kontury kończyn (separacja nóg, kierunek ramienia) z luminancji obrazu — informację, którą DPT/MiDaS często gubią przy postaciach w ciężkich szatach.  
+Następne wygładzanie usuwa ostre igły, zachowując szersze pasma cienia kodujące pozycje kończyn.
+
+| Flaga | Domyślnie | Opis |
+|---|---|---|
+| `--detail-strength` | `0.15` | Amplituda nakładki (0 = wyłączona). W trybie taktylnym użyj `0.05–0.08` |
+| `--detail-blur-sigma` | `1.2` | Dolnoprzepustowe odcięcie [px] dla ekstrakcji detalu. W trybie taktylnym użyj `2.5`, by wyodrębnić szerokie pasma cienia zamiast drobnych igieł |
+
+### Kwantyzacja z uwzględnieniem pierwszego planu
+
+| Flaga | Domyślnie | Opis |
+|---|---|---|
+| `--tactile-levels` | `0` | Włącz dyskretne poziomy wysokości (ustaw > 1). Suma = `--tactile-bg-levels` + `--tactile-fg-levels` |
+| `--tactile-fg-threshold` | `40.0` | Percentyl podziału tło/pierwszy plan |
+| `--tactile-bg-levels` | `2` | Dyskretne poziomy dla strefy tła (niebo, ziemia) |
+| `--tactile-fg-levels` | `4` | Dyskretne poziomy dla strefy pierwszego planu / postaci |
+| `--tactile-boundary-kernel` | `9` | Rozmiar jądra morfologicznego [px] do wygładzania granic. Ustaw `0`, by wyłączyć |
+
+### Wypełnianie wnętrz małych obiektów
+
+| Flaga | Domyślnie | Opis |
+|---|---|---|
+| `--fill-holes` | wył. | Włącz po fuzji; wypełnia płaskie wnętrza małych obiektów (zwierzęta, dalekie postacie) |
+| `--fill-holes-min-area` | `20` | Minimalna powierzchnia konturu [px²] |
+| `--fill-holes-max-area` | `2000` | Maksymalna powierzchnia konturu [px²] — dopasuj do przybliżonej powierzchni pikselowej obiektu |
+| `--fill-holes-kernel` | `5` | Jądro morfologiczne do zamykania konturów |
+
+### Parametry STL
+
+| Flaga | Domyślnie | Opis |
+|---|---|---|
+| `--width-mm` | `200` | Fizyczna szerokość modelu [mm] |
+| `--relief-mm` | `10` (`7` z `--tactile`) | Maksymalna wysokość reliefu ponad płytą bazową [mm] |
+| `--base-mm` | `3` | Grubość płyty bazowej [mm] |
+| `--mesh-px` | `512` (`140` z `--tactile`) | Maksymalna rozdzielczość siatki STL [px]. Użyj 200–256 dla taktylnego |
+
+---
+
+## Zalecane presety taktylne
+
+### Ciągły gradient (najlepszy punkt startowy)
+
+```bash
+python src/depth_pipeline.py --input obraz.jpg --output-dir output/tactile \
+    --tactile --tactile-multiscale \
+    --tactile-fine-sigma 1.5 --tactile-limb-sigma 3.0 \
+    --detail-strength 0.05 --detail-blur-sigma 2.5 \
+    --fill-holes \
+    --width-mm 200 --relief-mm 7 --mesh-px 200
+```
+
+### Muzealny relief stopniowany (6 dyskretnych poziomów, fg-aware)
+
+```bash
+python src/depth_pipeline.py --input obraz.jpg --output-dir output/tactile_stepped \
+    --tactile --tactile-multiscale \
+    --tactile-fine-sigma 1.5 --tactile-limb-sigma 3.0 \
+    --tactile-levels 6 --tactile-bg-levels 2 --tactile-fg-levels 4 \
+    --tactile-fg-threshold 40 --tactile-boundary-kernel 9 \
+    --width-mm 200 --relief-mm 7 --mesh-px 200
+```
+
+---
 
 ## Struktura projektu
 
 ```
 DepthForge/
-├── assets/              # Zasoby statyczne (obrazy podglądowe itp.)
-├── config.json          # Konfiguracja projektu
-├── requirements.txt     # Wymagane biblioteki
-├── benchmark.py         # Benchmark — wszystkie metody + ensemble
-├── src/                 # Kod źródłowy
-│   ├── depth_forge.py   # Główny moduł generowania map głębokości
-│   ├── depth_pipeline.py# Pełny pipeline: głębokość → STL
+├── assets/                  # Zasoby statyczne (obrazy podglądowe itp.)
+├── config.json              # Konfiguracja projektu
+├── requirements.txt         # Wymagane biblioteki
+├── benchmark.py             # Benchmark — wszystkie metody + ensemble
+├── src/
+│   ├── depth_forge.py       # Główny moduł generowania map głębokości (klasa DepthForge)
+│   ├── depth_pipeline.py    # Pełny pipeline: głębokość → ensemble → taktylny → STL
+│   │     Kluczowe funkcje:
+│   │       normalize_f32_robust()             normalizacja percentylowa
+│   │       fuse_depth_maps()                  fuzja ensemble ze skalowaniem skali
+│   │       apply_detail_overlay()             mikrodetal z luminancji obrazu
+│   │       fill_small_object_holes()          wypełnianie wnętrz małych obiektów
+│   │       prepare_for_touch()                jednoprzebiegowe wygładzanie taktylne
+│   │       prepare_for_touch_multiscale()     wieloskalowe wygładzanie taktylne
+│   │       quantize_depth()                   kwantyzacja equal-area
+│   │       quantize_depth_foreground_aware()  asymetryczna kwantyzacja tło/plan
+│   │       smooth_quantized_boundaries()      morfologiczne wygładzanie granic poziomów
+│   │       depth_to_stl()                     eksport watertight STL
+│   │       run_pipeline()                     orkiestracja pełnego pipeline'u
+│   │       run_pipeline_tactile()             wrapper z domyślnymi ustawieniami taktylnymi
 │   ├── advanced_3d_generator.py
-│   └── gimp_plugin.py   # Integracja z GIMP (w trakcie opracowania)
-├── data/                # Katalog danych wejściowych
-├── models/              # Modele ML (MiDaS i DPT w formacie OpenVINO)
-│   ├── midas/openvino/
-│   └── dpt/openvino/
-└── output/              # Katalog danych wyjściowych
+│   └── gimp_plugin.py       # Integracja z GIMP (w trakcie opracowania)
+├── data/                    # Obrazy wejściowe
+├── models/
+│   ├── midas/openvino/      # MiDaS v2.1 Small (OpenVINO IR)
+│   └── dpt/openvino/        # DPT Large (OpenVINO IR)
+└── output/                  # Wygenerowane mapy głębokości i pliki STL
 ```
+
+---
 
 ## Konfiguracja
 
-Konfiguracja znajduje się w pliku `config.json`:
-- `model.depth_estimation`: Ustawienia modelu estymacji głębokości
-- `processing`: Ustawienia przetwarzania obrazów
-- `tactile`: Ustawienia wizualizacji dotykowej
+`config.json` kontroluje ścieżki do modeli i podstawowe ustawienia przetwarzania:
 
-## Dla użytkowników zainteresowanych wizualizacjami 3D
+```json
+{
+  "model": {
+    "depth_estimation": {
+      "midas_model_path": "models/midas/openvino/midas_v21_small_256.xml",
+      "dpt_model_path":   "models/dpt/openvino/dpt_large.xml"
+    }
+  }
+}
+```
 
-Ten projekt jest zaprojektowany do tworzenia map głębokości, które mogą być wykorzystane do:
-1. Tworzenia dotykowych map 3D dla osób niewidomych
-2. Wizualizacji obrazów muzealnych w formie dotykalnej
-3. Integracji z systemami brajla i wizualizacji 3D
+---
 
-## Rozwój
+## Uwagi projektowe — pipeline taktylny
 
-Projekt może zostać rozbudowany o:
-- Integrację z konkretnymi modelami głębokości (MiDaS, DPT)
-- Wsparcie dla różnych formatów obrazów muzealnych
-- Interfejs graficzny
-- Obsługę kamer internetowych
-- Integrację z systemami druku 3D
+Pipeline taktylny oparty jest na muzealnych wytycznych tyflograficznych (RNIB, Museo del Prado):
+
+- **3–5 wyraźnie odróżnialnych poziomów wysokości** jest preferowanych nad ciągłym gradientem dla odczytu opuszkami palców
+- **Staircase noise** na granicach poziomów jest eliminowany przez morfologiczne domknięcie/otwarcie na maskach **indeksów całkowitych** — nie wartości float, które przy błędach zaokrąglenia tworzą setki mikro-obszarów zamiast kilku czystych stref
+- **Wygładzanie wieloskalowe** rozdziela drobny szum tekstury (~1–2 px, fałdy tkaniny, źdźbła trawy) od sensownej geometrii kończyn (~10–30 px, separacja nóg, kontury rąk) — bez jednego bliskozasięgowego Gaussa, który niszczyłby oba elementy jednocześnie
+- **Kwantyzacja z uwzględnieniem pierwszego planu** zapobiega sytuacji, w której rozległe tło (niebo, ziemia) pochłania większość dostępnych poziomów kosztem głównej postaci — tło dostaje 2 poziomy, postać 4
+- **Nakładka detalu przed wygładzaniem** przywraca informację o konturach kończyn z luminancji obrazu (którą DPT/MiDaS gubią przy postaciach w ciężkich szatach), a następne wygładzanie usuwa ostre igły, zachowując szersze pasma cienia kodujące pozycje nóg i rąk

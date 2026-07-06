@@ -35,22 +35,12 @@ The workflow is two-stage:
 
 ---
 
-## Description
-
-DepthForge is a tool for generating depth maps from museum images, designed for creating 3D tactile visualizations for people with visual impairments.
-
-This project enables processing of museum images to generate depth maps that can be used to create 3D tactile maps for people with visual impairments. It uses:
-- OpenCV for image operations
-- OpenVINO for efficient ML model processing
-- PyTorch for image analysis
-- Specialized algorithms for better depth visualization
-
 ## Requirements
 
 - Python 3.8+
-- OpenCV
+- OpenCV (opencv-contrib-python)
 - OpenVINO
-- PyTorch
+- PyTorch + torchvision
 - NumPy
 - SciPy
 - Scikit-image
@@ -66,7 +56,8 @@ cd DepthForge
 
 # Create virtual environment
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate      # Linux/macOS
+.venv\Scripts\activate         # Windows
 
 # Install required libraries
 pip install -r requirements.txt
@@ -82,28 +73,37 @@ python download_models.py
 ### Manual model download (optional)
 
 ```bash
-# Download only DPT Large
-python download_models.py --model dpt
-
-# Download only MiDaS
-python download_models.py --model midas
-
-# Specify a different release
-python download_models.py --release v0.1.0
+python download_models.py --model dpt      # DPT Large only
+python download_models.py --model midas    # MiDaS v2.1 Small only
+python download_models.py --release v0.1.0 # specific release
 ```
+
+---
 
 ## Usage
 
-### Single image
+### Visual pipeline — depth maps + STL
 
 ```bash
-python src/depth_forge.py --input input_image.jpg --output output_depth.png --enhanced-output enhanced_depth.png --tactile-output tactile_map.png
+python src/depth_pipeline.py --input data/Stanczyk.jpg \
+    --output-dir output/stanczyk \
+    --width-mm 200 --relief-mm 12
 ```
 
-### Full pipeline depth maps + STL (demo - waiting for correct project off Kuba for 3D printing)
+### Tactile pipeline — optimised for touch (tyflographic printing)
 
 ```bash
-python src/depth_pipeline.py --input data/Stańczyk.jpg --output-dir output/stanczyk --width-mm 200 --relief-mm 12
+python src/depth_pipeline.py \
+    --input data/Indian_summer_-_Google_Art_Project.jpg \
+    --output-dir output/indian_summer_tactile \
+    --tactile \
+    --tactile-multiscale \
+    --tactile-fine-sigma 1.5 \
+    --tactile-limb-sigma 3.0 \
+    --detail-strength 0.05 \
+    --detail-blur-sigma 2.5 \
+    --fill-holes \
+    --width-mm 200 --relief-mm 7 --mesh-px 200
 ```
 
 ### Batch processing
@@ -118,66 +118,195 @@ python src/depth_forge.py --batch --input-dir data/ --output-dir output/
 python benchmark.py
 ```
 
-## Features specific to museums
+---
 
-- Depth map generation for museum images
-- Optimization for 3D visualization
-- Support for 3D printing (tactile maps) — binary STL export
-- Integration with Braille systems and 3D visualization
+## Pipeline overview
 
-## Depth map versions
+```
+Input image
+    │
+    ├─► Standard synthetic depth map
+    ├─► OpenVINO MiDaS v2.1 Small
+    └─► OpenVINO DPT Large
+            │
+            ▼
+    Scale-shift ensemble fusion  (DPT×0.50 + MiDaS×0.35 + Standard×0.15)
+    Self-guided edge-preserving filter
+            │
+            ├─[--fill-holes]──► fill_small_object_holes()
+            │                   Patches flat interiors of small objects (animals,
+            │                   distant figures) undetected by depth models
+            │
+    ┌───────┴──────────────────────────────────────┐
+    │  VISUAL mode (default)   TACTILE mode (--tactile)          │
+    │                                              │
+    │  apply_detail_overlay()  [--detail-strength > 0]           │
+    │  Injects micro-texture   apply_detail_overlay() BEFORE     │
+    │  from image luminance    smoothing — recovers limb contours │
+    │                          from luminance shadow bands        │
+    │                                              │
+    │  postprocess_depth()     prepare_for_touch() or            │
+    │  CLAHE + mild Gaussian   prepare_for_touch_multiscale()    │
+    │                          Removes fine texture noise while  │
+    │                          preserving limb-scale contours    │
+    │                                              │
+    │                          [--tactile-levels > 1]            │
+    │                          quantize_depth_foreground_aware() │
+    │                          Asymmetric quantization:          │
+    │                          bg_levels for sky/ground,         │
+    │                          fg_levels for the main figure     │
+    │                                              │
+    │                          smooth_quantized_boundaries()     │
+    │                          Morphological closing/opening on  │
+    │                          integer level masks — eliminates  │
+    │                          staircase noise at level borders  │
+    └──────────────────────────────────────────────┘
+            │
+            ▼
+    depth_to_stl()  →  binary STL (watertight, Prusa-ready)
+```
 
-The project generates three different versions of the depth map:
-1. **Basic depth map** - generated based on image intensity
-2. **Enhanced depth map** - with applied contrast techniques (CLAHE)
-3. **Tactile map** - optimized for 3D printing for visually impaired people
+---
 
-## OpenVINO Integration
+## Tactile mode — complete parameter reference
 
-This project is designed to integrate with OpenVINO for improved depth estimation:
-- Support for MiDaS and DPT models
-- Efficient inference on CPU/GPU
-- Integration with 3D printing workflows
+Tactile mode (`--tactile`) is designed for 3D prints that will be **read by touch**, following museum tyflographic guidelines (RNIB, Museo del Prado standards).
 
-## Project Structure
+### Smoothing
+
+| Flag | Default | Description |
+|---|---|---|
+| `--tactile-median` | `5` | Median filter footprint [px] — removes isolated spike outliers before Gaussian |
+| `--tactile-sigma` | `3.5` | Gaussian σ [px] for single-pass smoothing (used when `--tactile-multiscale` is off) |
+| `--tactile-multiscale` | off | **Multi-scale smoothing** — separate removal of fine texture (clothing, grass) and preservation of limb-scale contours (legs, arms, hands) |
+| `--tactile-fine-sigma` | `1.5` | σ [px] for fine-texture removal in multiscale mode (1.2–1.5 recommended) |
+| `--tactile-limb-sigma` | `3.0` | σ [px] defining limb scale; final filter uses `limb_sigma × 0.5` to avoid merging adjacent legs/arms (2.5–3.5 recommended) |
+
+### Detail overlay in tactile mode
+
+In tactile mode, `--detail-strength > 0` applies `apply_detail_overlay()` **before** the smoothing step.  
+This recovers limb contours (leg separation, arm direction) from image luminance — information that DPT/MiDaS often miss in heavily draped figures.  
+The subsequent smoothing then removes sharp spikes while keeping the broader contour bands.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--detail-strength` | `0.15` | Overlay amplitude (0 = disabled). Use `0.05–0.08` in tactile mode |
+| `--detail-blur-sigma` | `1.2` | Low-pass cutoff [px] for detail extraction. Use `2.5` in tactile mode to extract broader shadow bands instead of fine spikes |
+
+### Foreground-aware quantization
+
+| Flag | Default | Description |
+|---|---|---|
+| `--tactile-levels` | `0` | Enable discrete height levels (set > 1). Total levels = `--tactile-bg-levels` + `--tactile-fg-levels` |
+| `--tactile-fg-threshold` | `40.0` | Percentile splitting background from foreground |
+| `--tactile-bg-levels` | `2` | Discrete levels for background zone (sky, ground) |
+| `--tactile-fg-levels` | `4` | Discrete levels for foreground/figure zone |
+| `--tactile-boundary-kernel` | `9` | Morphological kernel [px] for boundary smoothing. Set `0` to disable |
+
+### Small-object hole filling
+
+| Flag | Default | Description |
+|---|---|---|
+| `--fill-holes` | off | Enable after fusion; patches flat interiors of small objects (animals, distant figures) |
+| `--fill-holes-min-area` | `20` | Minimum contour area [px²] |
+| `--fill-holes-max-area` | `2000` | Maximum contour area [px²] — tune to the approximate pixel area of the target object |
+| `--fill-holes-kernel` | `5` | Morphological kernel for contour closing |
+
+### STL output
+
+| Flag | Default | Description |
+|---|---|---|
+| `--width-mm` | `200` | Physical width of the printed model [mm] |
+| `--relief-mm` | `10` (`7` with `--tactile`) | Maximum relief height above the base plate [mm] |
+| `--base-mm` | `3` | Base plate thickness [mm] |
+| `--mesh-px` | `512` (`140` with `--tactile`) | Maximum STL mesh resolution [px]. Use 200–256 for tactile to preserve limb geometry |
+
+---
+
+## Recommended tactile presets
+
+### Continuous gradient (best starting point)
+
+```bash
+python src/depth_pipeline.py --input image.jpg --output-dir output/tactile \
+    --tactile --tactile-multiscale \
+    --tactile-fine-sigma 1.5 --tactile-limb-sigma 3.0 \
+    --detail-strength 0.05 --detail-blur-sigma 2.5 \
+    --fill-holes \
+    --width-mm 200 --relief-mm 7 --mesh-px 200
+```
+
+### Museum step-relief (6 discrete levels, foreground-aware)
+
+```bash
+python src/depth_pipeline.py --input image.jpg --output-dir output/tactile_stepped \
+    --tactile --tactile-multiscale \
+    --tactile-fine-sigma 1.5 --tactile-limb-sigma 3.0 \
+    --tactile-levels 6 --tactile-bg-levels 2 --tactile-fg-levels 4 \
+    --tactile-fg-threshold 40 --tactile-boundary-kernel 9 \
+    --width-mm 200 --relief-mm 7 --mesh-px 200
+```
+
+---
+
+## Project structure
 
 ```
 DepthForge/
-├── assets/              # Static assets (preview images etc.)
-├── config.json          # Project configuration
-├── requirements.txt     # Required libraries
-├── benchmark.py         # Benchmark – all methods + ensemble
-├── src/                 # Source code
-│   ├── depth_forge.py   # Core depth map generation
-│   ├── depth_pipeline.py# Full pipeline: depth → STL
+├── assets/                  # Static assets (preview images etc.)
+├── config.json              # Project configuration
+├── requirements.txt         # Required libraries
+├── benchmark.py             # Benchmark – all methods + ensemble
+├── src/
+│   ├── depth_forge.py       # Core depth map generation (DepthForge class)
+│   ├── depth_pipeline.py    # Full pipeline: depth → ensemble → tactile → STL
+│   │     Key functions:
+│   │       normalize_f32_robust()             percentile-based normalisation
+│   │       fuse_depth_maps()                  scale-shift ensemble fusion
+│   │       apply_detail_overlay()             micro-detail from image luminance
+│   │       fill_small_object_holes()          patches flat object interiors
+│   │       prepare_for_touch()                single-pass tactile smoothing
+│   │       prepare_for_touch_multiscale()     multi-scale tactile smoothing
+│   │       quantize_depth()                   equal-area level quantization
+│   │       quantize_depth_foreground_aware()  asymmetric fg/bg quantization
+│   │       smooth_quantized_boundaries()      morphological boundary cleanup
+│   │       depth_to_stl()                     watertight STL export
+│   │       run_pipeline()                     full pipeline orchestrator
+│   │       run_pipeline_tactile()             tactile-safe wrapper
 │   ├── advanced_3d_generator.py
-│   └── gimp_plugin.py   # GIMP integration (work in progress)
-├── data/                # Input data directory
-├── models/              # ML models (MiDaS and DPT in OpenVINO format)
-│   ├── midas/openvino/
-│   └── dpt/openvino/
-└── output/              # Output directory
+│   └── gimp_plugin.py       # GIMP integration (work in progress)
+├── data/                    # Input images
+├── models/
+│   ├── midas/openvino/      # MiDaS v2.1 Small (OpenVINO IR)
+│   └── dpt/openvino/        # DPT Large (OpenVINO IR)
+└── output/                  # Generated depth maps and STL files
 ```
+
+---
 
 ## Configuration
 
-Configuration is located in `config.json`:
-- `model.depth_estimation`: Settings for depth estimation model
-- `processing`: Image processing settings
-- `tactile`: Tactile visualization settings
+`config.json` controls model paths and basic processing settings:
 
-## For users interested in 3D visualization
+```json
+{
+  "model": {
+    "depth_estimation": {
+      "midas_model_path": "models/midas/openvino/midas_v21_small_256.xml",
+      "dpt_model_path":   "models/dpt/openvino/dpt_large.xml"
+    }
+  }
+}
+```
 
-This project is designed to create depth maps that can be used to:
-1. Create 3D tactile maps for people with visual impairments
-2. Visualize museum images in tactile form
-3. Integrate with Braille systems and 3D visualization
+---
 
-## Development
+## Tactile pipeline design notes
 
-The project can be extended with:
-- Integration with specific depth estimation models (MiDaS, DPT)
-- Support for different museum image formats
-- Graphical interface
-- Webcam support
-- 3D printing system integration
+The tactile pipeline follows museum tyflographic guidelines (RNIB, Museo del Prado):
+
+- **3–5 clearly distinct height levels** are preferred over continuous gradients for fingertip reading
+- **Staircase noise** at level boundaries is eliminated by morphological closing/opening applied to integer-indexed level masks — not float values, which suffer from rounding errors that create hundreds of micro-regions instead of a few clean zones
+- **Multi-scale smoothing** separates fine texture noise (~1–2 px, clothing folds, grass blades) from meaningful limb-scale geometry (~10–30 px, leg separation, arm contours) without a single blunt Gaussian radius that would erase both indiscriminately
+- **Foreground-aware quantization** prevents the large background (sky, ground) from consuming most of the available levels at the expense of the main figure — background gets 2 levels, figure gets 4
+- **Detail overlay before smoothing** recovers limb contour information from image luminance (which DPT/MiDaS miss in heavily draped figures), then the subsequent smoothing removes the sharp spikes while keeping the broader shadow bands that encode limb positions
