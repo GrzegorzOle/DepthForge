@@ -841,16 +841,40 @@ class DepthForgePlugin(Gimp.PlugIn):
                 _log(f"STL exported: {stl_out_path}")
                 try:
                     from gi.repository import Gtk as _Gtk
+                    stl_folder = os.path.dirname(stl_out_path)
+                    stl_name   = os.path.basename(stl_out_path)
+
                     _dlg = _Gtk.MessageDialog(
                         message_type=_Gtk.MessageType.INFO,
-                        buttons=_Gtk.ButtonsType.OK,
+                        buttons=_Gtk.ButtonsType.NONE,
                         text="DepthForge – Eksport STL zakończony",
                     )
-                    _dlg.format_secondary_text(f"Model 3D zapisany:\n{stl_out_path}")
-                    _dlg.run()
+                    _dlg.format_secondary_text(
+                        f"Model 3D zapisany:\n{stl_out_path}"
+                    )
+                    # Przyciski: Otwórz folder  +  OK
+                    _dlg.add_button("Otwórz folder", 1)
+                    _dlg.add_button("OK",            0)
+                    _dlg.set_default_response(0)
+
+                    response = _dlg.run()
                     _dlg.destroy()
-                except Exception:
-                    pass
+
+                    if response == 1:
+                        # Otwórz folder w eksploratorze i zaznacz plik STL
+                        import subprocess as _sp, platform as _pl
+                        try:
+                            if _pl.system() == "Windows":
+                                # /select, zaznacza plik w Eksploratorze
+                                _sp.Popen(["explorer", "/select,", stl_out_path])
+                            elif _pl.system() == "Darwin":
+                                _sp.Popen(["open", "-R", stl_out_path])
+                            else:
+                                _sp.Popen(["xdg-open", stl_folder])
+                        except Exception as _oe:
+                            _log(f"open folder failed: {_oe}")
+                except Exception as _de:
+                    _log(f"STL dialog error: {_de}")
 
         except Exception:
             tb = traceback.format_exc()
