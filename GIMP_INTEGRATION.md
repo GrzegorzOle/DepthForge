@@ -1,110 +1,121 @@
-# DepthForge - GIMP Plugin Integration
+# DepthForge – GIMP 3.x Plugin Integration
 
-## DepthForge GIMP Plugin
+> **Wymagana wersja:** GIMP **3.2.x** lub nowszy  
+> Wtyczka korzysta z nowego API GObject-Introspection (`gi.repository`) i **nie**
+> jest kompatybilna z GIMP 2.x (stary Python-Fu / `gimpfu.register`).
 
-The DepthForge project can be extended with a GIMP plugin, enabling depth map generation directly within the graphical environment.
+---
 
-## Requirements:
+## Struktura plików
 
-- GIMP 2.10+ with Python-Fu support
-- Python 3.8+
-- All DepthForge project libraries
+```
+gimp_plugins/
+├── depthforge/               ← folder wymagany przez GIMP 3.x
+│   └── depthforge.py         ← główny plik wtyczki
+└── install_plugin.py         ← skrypt instalacyjny
+```
 
-## Plugin installation:
+GIMP 3.x wymaga, aby każda wtyczka Python znajdowała się we **własnym folderze**
+o tej samej nazwie co plik `.py`.
 
-1. **Copy the plugin file:**
+---
+
+## Instalacja automatyczna (zalecana)
+
+```powershell
+# Windows PowerShell – z katalogu projektu
+python gimp_plugins\install_plugin.py
+
+# Instalacja z jednoczesną instalacją zależności Python
+python gimp_plugins\install_plugin.py --install-deps
+
+# Odinstalowanie
+python gimp_plugins\install_plugin.py --uninstall
+```
+
+Skrypt skopiuje folder `depthforge/` do:
+
+| System  | Ścieżka                                                             |
+|---------|---------------------------------------------------------------------|
+| Windows | `%APPDATA%\GIMP\3.0\plug-ins\depthforge\`                           |
+| Linux   | `~/.config/GIMP/3.0/plug-ins/depthforge/`                          |
+| macOS   | `~/Library/Application Support/GIMP/3.0/plug-ins/depthforge/`      |
+
+---
+
+## Instalacja ręczna
+
+1. Skopiuj folder `gimp_plugins/depthforge/` do katalogu plug-ins GIMP.
+2. Na **Linux/macOS** nadaj uprawnienia wykonania:
    ```bash
-   cp src/gimp_plugin.py /path/to/gimp/plug-ins/
+   chmod +x ~/.config/GIMP/3.0/plug-ins/depthforge/depthforge.py
    ```
+3. **Uruchom ponownie GIMP.**
 
-2. **Grant permissions:**
-   ```bash
-   chmod +x /path/to/gimp/plug-ins/gimp_plugin.py
-   ```
+---
 
-3. **Start GIMP and reload plugins:**
-   - `Filters` → `DepthForge` → `Depth Map Generator`
+## Wymagania Python
 
-## Usage:
-
-### Command line:
-```bash
-python src/gimp_plugin.py --input image.jpg --output depth.png --enhancement 75
+```powershell
+pip install numpy opencv-python
 ```
 
-### Creating the plugin:
-```bash
-python src/gimp_plugin.py --create-plugin --plugin-dir gimp_plugins
+Biblioteki `gi` (GObject Introspection) są dostarczane razem z GIMP 3.x –
+**nie** wymagają osobnej instalacji pip.
+
+---
+
+## Użycie w GIMP
+
+1. Otwórz dowolny obraz w GIMP (obsługiwane tryby: RGB i GRAY).
+2. Przejdź do **Filtry → DepthForge → Generate Depth Map…**
+3. Ustaw parametry w oknie dialogowym:
+
+| Parametr | Opis |
+|---|---|
+| **Enhancement (0–100)** | Siła wzmocnienia kontrastu (CLAHE). 0 = brak, 100 = maksymalne. |
+| **Invert depth** | Odwraca mapę głębi – jasne piksele = daleko, ciemne = blisko. |
+| **Add as layer** | ✓ = dodaje wynik jako nową warstwę; odznacz, by otworzyć jako nowy obraz. |
+
+4. Kliknij **OK** – mapa głębi pojawi się jako nowa warstwa **Depth Map (DepthForge)**.
+
+---
+
+## Jak działa generowanie mapy głębi
+
+1. Piksele aktywnej warstwy są odczytywane przez **bufor GEGL** (natywne API GIMP 3.x).
+2. Jeśli w katalogu `src/` projektu dostępny jest pipeline DepthForge
+   (`depth_forge.py` + modele OpenVINO), wtyczka korzysta z modelu MiDaS.
+3. Gdy modele są niedostępne, stosowany jest **fallback syntetyczny**:
+   odwrócenie luminancji + mapa krawędzi (Laplacian) + CLAHE.
+4. Wynik jest wstawiany z powrotem do GIMP przez **shadow buffer GEGL**.
+
+---
+
+## Wywoływanie ze Script-Fu Console / Batch
+
+```scheme
+(plug-in-depthforge RUN-NONINTERACTIVE image drawable 75 FALSE TRUE)
+;; argumenty: enhancement-level  invert-depth  add-as-layer
 ```
 
-## Plugin features:
+---
 
-1. **Depth map generation** from images
-2. **Applying filters** and corrections
-3. **GIMP system integration**
-4. **Support for various image formats**
+## Rozwiązywanie problemów
 
-## Example usage in GIMP:
+| Problem | Rozwiązanie |
+|---|---|
+| Brak menu „Filters → DepthForge" | Sprawdź, czy folder `depthforge/` jest we właściwym katalogu plug-ins; uruchom GIMP ponownie. |
+| „Missing Python dependency" | `pip install numpy opencv-python` w środowisku Python GIMP. |
+| Błąd uprawnień (Linux/macOS) | `chmod +x ~/.config/GIMP/3.0/plug-ins/depthforge/depthforge.py` |
+| Mapa głębi jest szara/płaska | Zainstaluj modele OpenVINO (patrz `MODELS.md`) lub zwiększ Enhancement do 80+. |
 
-1. Open an image in GIMP
-2. Select `Filters` → `DepthForge` → `Depth Map Generator`
-3. Enter settings (enhancement level, size)
-4. Generate the depth map
-5. Use the map for further editing or export
+---
 
-## Required libraries:
+## Zgodność
 
-```bash
-pip install gimp
-```
-
-## Available options:
-
-- `--input` / `-i`: Path to the input image
-- `--output` / `-o`: Path to the output file
-- `--enhancement` / `-e`: Enhancement level (0-100)
-- `--create-plugin`: Creates plugin files for GIMP
-- `--plugin-dir`: Directory for plugin files
-
-## Version for GIMP 3.x:
-
-The plugin has been designed with GIMP 3.x compatibility in mind, but may require minor modifications depending on the specific version.
-
-## GIMP integration:
-
-The plugin integrates with GIMP via:
-- Python-Fu support
-- Reading and writing images in PNG format
-- Layer and channel handling
-- Integration with GIMP's filter menu
-
-## Testing:
-
-```bash
-# Test with a sample image
-python src/gimp_plugin.py --input data/sample_input.jpg --output output/gimp_test.png --enhancement 60
-```
-
-## Example usage in GIMP:
-
-1. Open an image in GIMP
-2. Select `Filters` → `DepthForge` → `Depth Map Generator`
-3. Set the enhancement level (e.g. 75)
-4. Click "OK"
-5. You will receive the depth map as a new layer
-
-## Technical support:
-
-If you encounter problems with the plugin installation:
-1. Make sure GIMP has Python-Fu support enabled
-2. Verify that all required libraries are installed
-3. Check the plugin file paths
-4. Run GIMP with administrator privileges (if required)
-
-## Future development:
-
-The plugin can be extended in the future with:
-- Support for additional image formats
-- Extra filters and effects
-- Integration with 3D printing systems
-- Simultaneous processing of multiple layers
+| GIMP    | Status                              |
+|---------|-------------------------------------|
+| 3.2.x   | ✅ Obsługiwane (GIMP 3.2.4)         |
+| 3.0.x   | ✅ Powinno działać                   |
+| 2.10.x  | ❌ Nie obsługiwane (stare gimpfu API)|

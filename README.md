@@ -31,7 +31,12 @@ The workflow is two-stage:
    This stage is led by **Jakub Oleksy**, specialist in 3D print analysis:  
    [linkedin.com/in/jakub-oleksy-672668333/](https://www.linkedin.com/in/jakub-oleksy-672668333/)
 
-> **GIMP Plugin** — the repository also contains a very early, preliminary integration layer for the GIMP image editor (`src/gimp_plugin.py`). The plugin is **not yet functional**; integration work is currently in progress.
+> **GIMP Plugin** — fully functional plugin for GIMP 3.2.x is included in `gimp_plugins/`.  
+> Install with `python gimp_plugins/install_plugin.py` — the script auto-detects the project path  
+> and writes `depthforge_install.json` to GIMP's plug-ins directory so the plugin always finds  
+> the correct models, regardless of where the project is cloned.  
+> Features: Visual mode (CLAHE) · Tactile mode (v9 params: fill-holes + detail-overlay + multiscale)  
+> · Colour (INFERNO) or grayscale output · STL export.
 
 ---
 
@@ -50,20 +55,24 @@ The workflow is two-stage:
 ## Installation
 
 ```bash
-# Clone the repository
+# 1. Clone the repository
 git clone https://github.com/GrzegorzOle/DepthForge.git
 cd DepthForge
 
-# Create virtual environment
+# 2. Create virtual environment and install dependencies
 python -m venv .venv
-source .venv/bin/activate      # Linux/macOS
 .venv\Scripts\activate         # Windows
-
-# Install required libraries
+# source .venv/bin/activate    # Linux/macOS
 pip install -r requirements.txt
 
-# Download OpenVINO models (DPT Large + MiDaS v2.1 Small)
+# 3. Download OpenVINO models (DPT Large + MiDaS v2.1 Small, ~685 MB)
 python download_models.py
+
+# 4. Install GIMP plugin  (requires GIMP 3.2.x already installed)
+python gimp_plugins/install_plugin.py
+
+# 5. Restart GIMP
+#    Plugin available at: Filters → DepthForge → Generate Depth Map…
 ```
 
 > **Note:** Model weights are not stored in the repository (they exceed GitHub's 100 MB file limit).  

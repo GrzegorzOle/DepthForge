@@ -1,11 +1,13 @@
-opencv-contrib-python==4.13.0.92
-openvino==2026.2.0
-torch==2.12.0
-torchvision==0.27.0
-numpy==1.24.3
-matplotlib==3.7.2
-pillow==10.0.1
-scipy==1.17.1
-scikit-image==0.26.0
+# DepthForge – Python dependencies
+# Requires Python 3.10 – 3.12 for pre-built binary wheels.
+# Python 3.13+ is NOT yet supported by numpy/scipy/torch binaries.
+
+numpy>=2.0.0
+opencv-contrib-python>=4.9.0
+openvino>=2024.0.0
+scipy>=1.11.0
+matplotlib>=3.7.0
+pillow>=10.0.0
+scikit-image>=0.21.0
 numpy-stl>=3.1.0
 transformers>=4.40.0
