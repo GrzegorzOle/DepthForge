@@ -205,18 +205,26 @@ def _write_png_rgb(path: str, width: int, height: int, rgb_bytes: bytes):
 _HELPER_SCRIPT = r"""
 # DepthForge GIMP helper – runs in project .venv (has numpy, opencv, openvino)
 # Pipeline: Standard + OpenVINO MiDaS + OpenVINO DPT → ensemble fusion →
-#   Visual:  postprocess_depth (CLAHE + Gaussian)
-#   Tactile: fill_holes → detail_overlay → multiscale_smooth (v9 params)
+#   Visual:    postprocess_depth (CLAHE + Gaussian)
+#   Tactile:   fill_holes → detail_overlay → multiscale_smooth (v9 presets)
+#   Advanced:  jak taktylny, ale ze wszystkimi parametrami z argv
 import sys, os
 
-input_png      = sys.argv[1]
-output_png     = sys.argv[2]
-enhancement    = int(sys.argv[3])              if len(sys.argv) > 3 else 50
-invert         = sys.argv[4].lower() == "true" if len(sys.argv) > 4 else False
-project_root   = sys.argv[5]                   if len(sys.argv) > 5 else ""
-color_out_png  = sys.argv[6]                   if len(sys.argv) > 6 else ""
-stl_out_path   = sys.argv[7]                   if len(sys.argv) > 7 else ""
-tactile_mode   = sys.argv[8].lower() == "true" if len(sys.argv) > 8 else False
+input_png         = sys.argv[1]
+output_png        = sys.argv[2]
+enhancement       = int(sys.argv[3])               if len(sys.argv) > 3  else 50
+invert            = sys.argv[4].lower() == "true"  if len(sys.argv) > 4  else False
+project_root      = sys.argv[5]                    if len(sys.argv) > 5  else ""
+color_out_png     = sys.argv[6]                    if len(sys.argv) > 6  else ""
+stl_out_path      = sys.argv[7]                    if len(sys.argv) > 7  else ""
+tactile_mode      = sys.argv[8].lower() == "true"  if len(sys.argv) > 8  else False
+advanced_mode     = sys.argv[9].lower() == "true"  if len(sys.argv) > 9  else False
+detail_strength   = float(sys.argv[10])            if len(sys.argv) > 10 else 0.05
+detail_blur_sigma = float(sys.argv[11])            if len(sys.argv) > 11 else 2.5
+fine_sigma        = float(sys.argv[12])            if len(sys.argv) > 12 else 1.5
+limb_sigma        = float(sys.argv[13])            if len(sys.argv) > 13 else 3.0
+fill_holes        = sys.argv[14].lower() == "true" if len(sys.argv) > 14 else True
+tactile_levels    = int(sys.argv[15])              if len(sys.argv) > 15 else 0
 
 # ── Make DepthForge importable ────────────────────────────────────────────────
 if project_root:
@@ -235,18 +243,18 @@ if img is None:
     sys.exit(f"READ_ERROR: cannot read {input_png}")
 
 # enhancement (0-100) → clahe_clip dla postprocess_depth (tylko tryb visual)
-# domyślna wartość w pipeline = 2.0 odpowiada enhancement=50
 clahe_clip = enhancement / 25.0   # 0→0.0, 50→2.0, 100→4.0
 
-depth_u8 = None   # wynik końcowy uint8 [0-255]
+depth_u8 = None
 
-# ── 1. Pełny pipeline DepthForge: Standard + MiDaS OV + DPT OV + ensemble ────
+# ── 1. Pełny pipeline: Standard + MiDaS OV + DPT OV + ensemble ───────────────
 try:
     from depth_pipeline import (
         fuse_depth_maps, postprocess_depth,
         normalize_f32_robust, DepthForge,
         fill_small_object_holes, apply_detail_overlay,
         prepare_for_touch_multiscale,
+        quantize_depth_foreground_aware, smooth_quantized_boundaries,
     )
     import time
 
@@ -275,8 +283,6 @@ try:
             print(f"OpenVINO DPT NOT found: {dpt_path}", flush=True)
 
     depth_maps_f32 = {}
-
-    # Standard (syntetyczny)
     t0 = time.perf_counter()
     s = df.generate_depth_map_midas(img)
     if s is not None:
@@ -284,16 +290,12 @@ try:
             s = cv2.cvtColor(s, cv2.COLOR_BGR2GRAY)
         depth_maps_f32["standard"] = normalize_f32_robust(s.astype(np.float32))
         print(f"  Standard:  {(time.perf_counter()-t0)*1000:.0f} ms", flush=True)
-
-    # MiDaS OpenVINO
     if midas_compiled:
         t0 = time.perf_counter()
         m = df._run_openvino_inference_f32(midas_compiled, img, "midas")
         if m is not None:
             depth_maps_f32["midas"] = m.astype(np.float32)
             print(f"  MiDaS OV:  {(time.perf_counter()-t0)*1000:.0f} ms", flush=True)
-
-    # DPT OpenVINO
     if dpt_compiled:
         t0 = time.perf_counter()
         d = df._run_openvino_inference_f32(dpt_compiled, img, "dpt")
@@ -302,11 +304,9 @@ try:
             print(f"  DPT OV:    {(time.perf_counter()-t0)*1000:.0f} ms", flush=True)
 
     print(f"  Modele: {list(depth_maps_f32.keys())}", flush=True)
-
     if not depth_maps_f32:
         raise RuntimeError("Żaden model nie zwrócił mapy głębi")
 
-    # Fuzja ensemble (scale-shift alignment)
     if len(depth_maps_f32) > 1:
         fused = fuse_depth_maps(depth_maps_f32)
         print(f"  Ensemble fusion: {list(depth_maps_f32.keys())}", flush=True)
@@ -316,33 +316,72 @@ try:
         print(f"  Pojedynczy model: {key}", flush=True)
 
     # ── Post-processing ───────────────────────────────────────────────────────
-    if tactile_mode:
-        # === TRYB TAKTYLNY (parametry v9) =====================================
-        # Identyczny pipeline jak indian_summer_tactile_v9:
-        #   fill_holes → detail_overlay(0.05, 2.5) → multiscale_smooth(1.5, 3.0)
-        #   → postprocess bez CLAHE i Gaussiana (obsługiwane przez multiscale)
-        print("  Tryb: TAKTYLNY (v9 params)", flush=True)
+    if not tactile_mode and not advanced_mode:
+        # === TRYB WIZUALNY ====================================================
+        print("  Tryb: WIZUALNY (CLAHE + Gaussian)", flush=True)
+        depth_u8 = postprocess_depth(fused, clahe_clip=clahe_clip, sigma=0.7)
 
-        # Krok 1: wypełnienie wnętrz małych obiektów
-        fused = fill_small_object_holes(fused, min_area=20, max_area=2000, kernel_size=5)
-        print("  fill_holes OK", flush=True)
+    else:
+        # === TRYB TAKTYLNY lub ZAAWANSOWANY ===================================
+        # W trybie zaawansowanym używamy parametrów z argv,
+        # w trybie taktylnym (v9 preset) używamy stałych wartości
+        if advanced_mode:
+            _detail_str   = detail_strength
+            _detail_blur  = detail_blur_sigma
+            _fine_s       = fine_sigma
+            _limb_s       = limb_sigma
+            _fill         = fill_holes
+            _levels       = tactile_levels
+            print(f"  Tryb: ZAAWANSOWANY (parametry ręczne)", flush=True)
+            print(f"    detail_strength={_detail_str}  blur_sigma={_detail_blur}", flush=True)
+            print(f"    fine_sigma={_fine_s}  limb_sigma={_limb_s}", flush=True)
+            print(f"    fill_holes={_fill}  levels={_levels}", flush=True)
+        else:
+            # v9 presets
+            _detail_str  = 0.05
+            _detail_blur = 2.5
+            _fine_s      = 1.5
+            _limb_s      = 3.0
+            _fill        = True
+            _levels      = 0
+            print("  Tryb: TAKTYLNY (v9 presets)", flush=True)
 
-        # Krok 2: nakładka mikrodetali (kontury kończyn z luminancji)
-        fused = apply_detail_overlay(fused, img, strength=0.05, blur_sigma=2.5)
-        print("  detail_overlay(0.05, 2.5) OK", flush=True)
+        # Krok 1: fill holes
+        if _fill:
+            fused = fill_small_object_holes(fused, min_area=20, max_area=2000, kernel_size=5)
+            print("  fill_holes OK", flush=True)
+
+        # Krok 2: detail overlay
+        if _detail_str > 0.0:
+            fused = apply_detail_overlay(fused, img,
+                                         strength=_detail_str,
+                                         blur_sigma=_detail_blur)
+            print(f"  detail_overlay({_detail_str}, {_detail_blur}) OK", flush=True)
 
         # Krok 3: wieloskalowe wygładzanie taktylne
         fused = prepare_for_touch_multiscale(
-            fused, median_size=5, fine_sigma=1.5, limb_sigma=3.0
+            fused, median_size=5, fine_sigma=_fine_s, limb_sigma=_limb_s
         )
-        print("  multiscale_smooth(fine=1.5, limb=3.0) OK", flush=True)
+        print(f"  multiscale_smooth(fine={_fine_s}, limb={_limb_s}) OK", flush=True)
 
-        # Krok 4: postprocess bez CLAHE (prepare_for_touch już wygłodziło)
+        # Krok 4: kwantyzacja (opcjonalna)
+        if _levels > 1:
+            bg_levels = max(1, _levels // 3)
+            fg_levels = _levels - bg_levels
+            fused, _level_idx, _n_levels = quantize_depth_foreground_aware(
+                fused,
+                fg_threshold_pct=40.0,
+                bg_levels=bg_levels,
+                fg_levels=fg_levels,
+            )
+            fused = smooth_quantized_boundaries(
+                fused, level_idx=_level_idx, n_levels=_n_levels, kernel_size=9
+            )
+            print(f"  quantize({bg_levels}bg+{fg_levels}fg) + boundary_smooth OK",
+                  flush=True)
+
+        # Krok 5: postprocess bez CLAHE
         depth_u8 = postprocess_depth(fused, clahe_clip=0.0, sigma=0.0)
-    else:
-        # === TRYB WIZUALNY (standardowy) ======================================
-        print("  Tryb: WIZUALNY (CLAHE + Gaussian)", flush=True)
-        depth_u8 = postprocess_depth(fused, clahe_clip=clahe_clip, sigma=0.7)
 
     print("  Pipeline OK", flush=True)
 
@@ -352,7 +391,7 @@ except Exception as e:
     traceback.print_exc()
     depth_u8 = None
 
-# ── 2. Fallback: syntetyczny estymator jeśli pipeline się nie powiódł ─────────
+# ── 2. Fallback: syntetyczny estymator ────────────────────────────────────────
 if depth_u8 is None:
     print("Fallback: syntetyczny estymator głębi", flush=True)
     gray  = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
@@ -497,6 +536,49 @@ class DepthForgePlugin(Gimp.PlugIn):
             "Wyłącz dla trybu wizualnego z CLAHE.",
             False, GObject.ParamFlags.READWRITE,
         )
+        # ── Tryb zaawansowany – ręczna kontrola wszystkich parametrów ─────────
+        procedure.add_boolean_argument(
+            "advanced-mode", "Tryb _zaawansowany (parametry ręczne)",
+            "Gdy zaznaczony: ignoruje predefiniowane ustawienia v9 i używa "
+            "poniższych parametrów ręcznych. Działa razem z trybem taktylnym.",
+            False, GObject.ParamFlags.READWRITE,
+        )
+        procedure.add_double_argument(
+            "detail-strength", "  Detail strength (0–1)",
+            "Siła nakładki mikrodetali z luminancji obrazu. "
+            "0 = wyłączona. Zalecane: 0.05–0.08 (taktylny), 0.10–0.20 (wizualny).",
+            0.0, 1.0, 0.05, GObject.ParamFlags.READWRITE,
+        )
+        procedure.add_double_argument(
+            "detail-blur-sigma", "  Detail blur sigma [px]",
+            "Odcięcie częstotliwościowe nakładki. Wyższe = szersze pasma (kontury kończyn). "
+            "Zalecane: 2.5 (taktylny), 1.2 (wizualny).",
+            0.1, 15.0, 2.5, GObject.ParamFlags.READWRITE,
+        )
+        procedure.add_double_argument(
+            "fine-sigma", "  Fine sigma [px] (multiscale)",
+            "Usunięcie drobnego szumu tekstury (tkanina, trawa). "
+            "Zalecane: 1.2–1.5.",
+            0.1, 10.0, 1.5, GObject.ParamFlags.READWRITE,
+        )
+        procedure.add_double_argument(
+            "limb-sigma", "  Limb sigma [px] (multiscale)",
+            "Skala kończyn – filtr końcowy używa limb_sigma×0.5, "
+            "żeby nie zlewać sąsiednich nóg/rąk. Zalecane: 2.5–3.5.",
+            0.5, 15.0, 3.0, GObject.ParamFlags.READWRITE,
+        )
+        procedure.add_boolean_argument(
+            "fill-holes", "  Fill holes (małe obiekty)",
+            "Wypełnia płaskie wnętrza małych obiektów (zwierzęta, dalekie postaci) "
+            "nierozpoznanych przez modele głębi.",
+            True, GObject.ParamFlags.READWRITE,
+        )
+        procedure.add_int_argument(
+            "tactile-levels", "  Tactile levels (0=ciągły)",
+            "Kwantyzacja na N dyskretnych poziomów (0 = gradient ciągły). "
+            "Zalecane dla druku muzealnego: 6 (2 tło + 4 pierwszoplan).",
+            0, 12, 0, GObject.ParamFlags.READWRITE,
+        )
         return procedure
 
     def _create_diag_procedure(self, name):
@@ -606,9 +688,19 @@ class DepthForgePlugin(Gimp.PlugIn):
         color_depth_layer = config.get_property("color-depth-layer")
         export_stl        = config.get_property("export-stl")
         tactile_mode      = config.get_property("tactile-mode")
+        advanced_mode     = config.get_property("advanced-mode")
+        detail_strength   = config.get_property("detail-strength")
+        detail_blur_sigma = config.get_property("detail-blur-sigma")
+        fine_sigma        = config.get_property("fine-sigma")
+        limb_sigma        = config.get_property("limb-sigma")
+        fill_holes        = config.get_property("fill-holes")
+        tactile_levels    = config.get_property("tactile-levels")
 
         _log(f"params: enhancement={enhancement} invert={invert_depth} "
-             f"color={color_depth_layer} stl={export_stl} tactile={tactile_mode}")
+             f"color={color_depth_layer} stl={export_stl} tactile={tactile_mode} "
+             f"advanced={advanced_mode} detail_str={detail_strength} "
+             f"detail_blur={detail_blur_sigma} fine_s={fine_sigma} "
+             f"limb_s={limb_sigma} fill_holes={fill_holes} levels={tactile_levels}")
 
         ext_python = _find_external_python()
         if not ext_python:
@@ -789,6 +881,13 @@ class DepthForgePlugin(Gimp.PlugIn):
                 tmp_color,
                 stl_out_path,
                 str(tactile_mode).lower(),
+                str(advanced_mode).lower(),
+                str(detail_strength),
+                str(detail_blur_sigma),
+                str(fine_sigma),
+                str(limb_sigma),
+                str(fill_holes).lower(),
+                str(tactile_levels),
             ]
             _log(f"Subprocess cmd: {' '.join(cmd[:3])} ...")
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
