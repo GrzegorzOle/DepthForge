@@ -59,6 +59,29 @@ pip install -e ".[convert]"   # PyTorch + transformers
 
 ## Instalacja
 
+### Dla użytkowników GIMP-a — pakiet samodzielny (zalecane)
+
+Jeśli chcesz tylko wtyczki do GIMP-a, **nie potrzebujesz** Pythona, środowiska
+wirtualnego ani tego repozytorium. Pobierz pakiet dla swojego systemu ze
+[strony wydań](https://github.com/GrzegorzOle/DepthForge/releases/latest),
+rozpakuj go w miejscu, gdzie ma zostać na stałe, i uruchom jedno polecenie:
+
+| Platforma | Plik do pobrania | Instalacja |
+|---|---|---|
+| Linux x86_64 (glibc 2.28+) | `DepthForge-0.1.0-linux-x86_64.tar.gz` | `./install.sh` |
+| Windows 10/11 64-bit | `DepthForge-0.1.0-windows-x86_64.zip` | dwuklik w `install.bat` |
+
+Pakiet zawiera własnego CPythona 3.12 z zainstalowanymi numpy, OpenCV, OpenVINO
+i SciPy, więc jest niezależny zarówno od Pythona systemowego, jak i od Pythona
+wbudowanego w GIMP-a (który jest w innej wersji i nie rozwiązuje tych
+zależności). Instalator kopiuje wtyczkę do GIMP-a, wskazuje jej interpreter z
+pakietu i pobiera modele.
+
+Pełna instrukcja dla użytkownika jest w środku pakietu jako `INSTALL_PL.md` /
+`INSTALL_EN.md`, a w repozytorium leży w `packaging/bundle_files/`.
+
+### Dla programistów — ze źródeł
+
 ```bash
 # Sklonuj repozytorium
 git clone https://github.com/GrzegorzOle/DepthForge.git
@@ -87,6 +110,22 @@ python download_models.py --model dpt      # tylko DPT Large
 python download_models.py --model midas    # tylko MiDaS v2.1 Small
 python download_models.py --release v0.1.0 # konkretne wydanie
 ```
+
+### Budowanie pakietów samodzielnych
+
+Oba pakiety składa się **z Linuksa** — windowsowy przez pobranie wheeli
+`win_amd64` poleceniem `pip --platform`, a nie przez uruchomienie interpretera
+Windows:
+
+```bash
+python packaging/build_bundle.py                 # obie platformy → dist/
+python packaging/build_bundle.py --target linux
+python packaging/build_bundle.py --with-models   # z modelami w środku (~686 MB)
+```
+
+Build linuksowy weryfikuje sam siebie, przepuszczając prawdziwy pipeline
+taktylny przez dołączony interpreter. Builda windowsowego nie da się uruchomić
+na Linuksie, więc z założenia pozostaje nieprzetestowany.
 
 ---
 

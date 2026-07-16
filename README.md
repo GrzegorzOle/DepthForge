@@ -58,6 +58,29 @@ pip install -e ".[convert]"   # PyTorch + transformers
 
 ## Installation
 
+### For GIMP users — the standalone bundle (recommended)
+
+If you only want the GIMP plugin, you do **not** need Python, a virtualenv, or
+this repository. Download the bundle for your system from the
+[Releases page](https://github.com/GrzegorzOle/DepthForge/releases/latest),
+unpack it somewhere permanent, and run one command:
+
+| Platform | Download | Install |
+|---|---|---|
+| Linux x86_64 (glibc 2.28+) | `DepthForge-0.1.0-linux-x86_64.tar.gz` | `./install.sh` |
+| Windows 10/11 64-bit | `DepthForge-0.1.0-windows-x86_64.zip` | double-click `install.bat` |
+
+The bundle ships its own CPython 3.12 with numpy, OpenCV, OpenVINO and SciPy
+pre-installed, so it is independent of both your system Python and GIMP's
+bundled one (which is a different version and cannot resolve these
+dependencies). The installer copies the plugin into GIMP, points it at the
+bundled interpreter, and downloads the models.
+
+Full end-user instructions ship inside the bundle as `INSTALL_EN.md` /
+`INSTALL_PL.md`, and live in the repository under `packaging/bundle_files/`.
+
+### For developers — from source
+
 ```bash
 # 1. Clone the repository
 git clone https://github.com/GrzegorzOle/DepthForge.git
@@ -90,6 +113,21 @@ python download_models.py --model dpt      # DPT Large only
 python download_models.py --model midas    # MiDaS v2.1 Small only
 python download_models.py --release v0.1.0 # specific release
 ```
+
+### Building the standalone bundles
+
+Both bundles are assembled **from Linux** — the Windows one by fetching
+`win_amd64` wheels via `pip --platform`, not by running a Windows interpreter:
+
+```bash
+python packaging/build_bundle.py                 # both platforms → dist/
+python packaging/build_bundle.py --target linux
+python packaging/build_bundle.py --with-models   # embed the models (~686 MB)
+```
+
+The Linux build verifies itself by running the real tactile pipeline through
+the bundled interpreter; the Windows build cannot be executed on Linux and is
+therefore unverified by construction.
 
 ---
 

@@ -24,7 +24,7 @@ def read_requirements(filename: str) -> list[str]:
 
 setup(
     name="depthforge",
-    version="0.1.0",
+    version="0.1.2",
     author="Grzegorz Oleksy",
     author_email="oleksy@cdest.eu",
     description=(
