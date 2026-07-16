@@ -1,13 +1,21 @@
-# DepthForge – Python dependencies
-# Requires Python 3.10 – 3.12 for pre-built binary wheels.
-# Python 3.13+ is NOT yet supported by numpy/scipy/torch binaries.
+# DepthForge – runtime dependencies
+#
+# Requires Python 3.10+ (developed and tested up to 3.14).
+#
+# This list covers everything needed to run the depth pipeline
+# (src/depth_pipeline.py), the batch CLI (src/depth_forge.py) and the
+# GIMP plugin helper. Install with:
+#
+#     pip install -r requirements.txt
+#
+# The model-conversion tools (convert.py, DPT → ONNX) additionally need
+# torch + transformers — those are NOT installed here on purpose, as the
+# CUDA wheels add ~2 GB and the pipeline itself never imports them:
+#
+#     pip install -e ".[convert]"
 
 numpy>=2.0.0
 opencv-contrib-python>=4.9.0
 openvino>=2024.0.0
 scipy>=1.11.0
-matplotlib>=3.7.0
-pillow>=10.0.0
-scikit-image>=0.21.0
 numpy-stl>=3.1.0
-transformers>=4.40.0

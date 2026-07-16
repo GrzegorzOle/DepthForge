@@ -31,21 +31,31 @@ Proces przebiega dwuetapowo:
    Za ten etap odpowiada **Jakub Oleksy**, specjalista ds. analizy druku 3D:  
    [linkedin.com/in/jakub-oleksy-672668333/](https://www.linkedin.com/in/jakub-oleksy-672668333/)
 
-> **Wtyczka GIMP** — repozytorium zawiera również wstępną, zalążkową warstwę integracji z edytorem graficznym GIMP (`src/gimp_plugin.py`). Wtyczka **nie jest jeszcze funkcjonalna** — trwają prace integracyjne.
+> **Wtyczka GIMP** — w pełni funkcjonalna wtyczka dla GIMP 3.2.x znajduje się w katalogu `gimp_plugins/`.  
+> Instalacja: `python gimp_plugins/install_plugin.py` — skrypt automatycznie wykrywa ścieżkę projektu  
+> i zapisuje `depthforge_install.json` w katalogu plug-ins GIMP-a, dzięki czemu wtyczka zawsze znajduje  
+> właściwe modele, niezależnie od miejsca sklonowania projektu.  
+> Funkcje: tryb wizualny (CLAHE) · tryb taktylny (parametry v9: fill-holes + detail-overlay + multiscale)  
+> · wyjście kolorowe (INFERNO) lub w skali szarości · eksport STL.
 
 ---
 
 ## Wymagania
 
-- Python 3.8+
+- Python 3.10+
+- NumPy
 - OpenCV (opencv-contrib-python)
 - OpenVINO
-- PyTorch + torchvision
-- NumPy
 - SciPy
-- Scikit-image
 - numpy-stl
-- transformers
+
+Opcjonalnie — potrzebne wyłącznie do samodzielnej konwersji modeli
+(`convert.py`, DPT → ONNX). Pipeline nigdy ich nie importuje, a pakiety CUDA
+zajmują ~2 GB:
+
+```bash
+pip install -e ".[convert]"   # PyTorch + transformers
+```
 
 ## Instalacja
 
@@ -273,8 +283,9 @@ DepthForge/
 │   │       depth_to_stl()                     eksport watertight STL
 │   │       run_pipeline()                     orkiestracja pełnego pipeline'u
 │   │       run_pipeline_tactile()             wrapper z domyślnymi ustawieniami taktylnymi
-│   ├── advanced_3d_generator.py
-│   └── gimp_plugin.py       # Integracja z GIMP (w trakcie opracowania)
+├── gimp_plugins/
+│   ├── depthforge/          # Wtyczka GIMP 3.x (folder ładowany przez GIMP)
+│   └── install_plugin.py    # Skrypt instalacyjny wtyczki
 ├── data/                    # Obrazy wejściowe
 ├── models/
 │   ├── midas/openvino/      # MiDaS v2.1 Small (OpenVINO IR)

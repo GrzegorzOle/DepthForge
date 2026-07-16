@@ -11,12 +11,6 @@
         "output": "./output"
     },
     "model": {
-        "yolo": {
-            "version": "yolov8",
-            "size": "n",
-            "confidence_threshold": 0.5,
-            "iou_threshold": 0.4
-        },
         "depth_estimation": {
             "method": "openvino",
             "backend": "midas",

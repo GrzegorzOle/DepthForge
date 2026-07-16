@@ -42,15 +42,19 @@ The workflow is two-stage:
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.10+
+- NumPy
 - OpenCV (opencv-contrib-python)
 - OpenVINO
-- PyTorch + torchvision
-- NumPy
 - SciPy
-- Scikit-image
 - numpy-stl
-- transformers
+
+Optional — only needed to convert the models yourself (`convert.py`, DPT → ONNX).
+The pipeline never imports these, and the CUDA wheels add ~2 GB:
+
+```bash
+pip install -e ".[convert]"   # PyTorch + transformers
+```
 
 ## Installation
 
@@ -282,8 +286,9 @@ DepthForge/
 │   │       depth_to_stl()                     watertight STL export
 │   │       run_pipeline()                     full pipeline orchestrator
 │   │       run_pipeline_tactile()             tactile-safe wrapper
-│   ├── advanced_3d_generator.py
-│   └── gimp_plugin.py       # GIMP integration (work in progress)
+├── gimp_plugins/
+│   ├── depthforge/          # GIMP 3.x plugin (the folder GIMP loads)
+│   └── install_plugin.py    # Plugin installer
 ├── data/                    # Input images
 ├── models/
 │   ├── midas/openvino/      # MiDaS v2.1 Small (OpenVINO IR)
