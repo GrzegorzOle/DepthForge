@@ -62,23 +62,36 @@ pip install -e ".[convert]"   # PyTorch + transformers
 ### Dla użytkowników GIMP-a — pakiet samodzielny (zalecane)
 
 Jeśli chcesz tylko wtyczki do GIMP-a, **nie potrzebujesz** Pythona, środowiska
-wirtualnego ani tego repozytorium. Pobierz pakiet dla swojego systemu ze
-[strony wydań](https://github.com/GrzegorzOle/DepthForge/releases/latest),
-rozpakuj go w miejscu, gdzie ma zostać na stałe, i uruchom jedno polecenie:
+wirtualnego ani tego repozytorium. Wybierz jeden plik ze
+[strony wydań](https://github.com/GrzegorzOle/DepthForge/releases/latest):
 
-| Platforma | Plik do pobrania | Instalacja |
-|---|---|---|
-| Linux x86_64 (glibc 2.28+) | `DepthForge-0.1.0-linux-x86_64.tar.gz` | `./install.sh` |
-| Windows 10/11 64-bit | `DepthForge-0.1.0-windows-x86_64.zip` | dwuklik w `install.bat` |
+| Platforma | Plik do pobrania | Instalacja | Modele |
+|---|---|---|---|
+| Windows 10/11 64-bit | `DepthForge-0.1.3-windows-x86_64-setup.exe` | uruchom | w środku |
+| Linux x86_64 (glibc 2.28+) | `DepthForge-0.1.3-x86_64.AppImage` | `chmod +x` i uruchom | w środku |
+| Dowolna, bez modeli | `…-linux-x86_64.tar.gz` / `…-windows-x86_64.zip` | `./install.sh` / `install.bat` | pobierane przy instalacji |
 
-Pakiet zawiera własnego CPythona 3.12 z zainstalowanymi numpy, OpenCV, OpenVINO
-i SciPy, więc jest niezależny zarówno od Pythona systemowego, jak i od Pythona
-wbudowanego w GIMP-a (który jest w innej wersji i nie rozwiązuje tych
-zależności). Instalator kopiuje wtyczkę do GIMP-a, wskazuje jej interpreter z
-pakietu i pobiera modele.
+Dwa pierwsze to pakiety **offline** — niosą modele OpenVINO (~686 MB) w środku,
+więc instalacja w ogóle nie wymaga internetu. Archiwa są mniejsze, ale dociągają
+modele w trakcie instalacji.
 
-Pełna instrukcja dla użytkownika jest w środku pakietu jako `INSTALL_PL.md` /
-`INSTALL_EN.md`, a w repozytorium leży w `packaging/bundle_files/`.
+Każdy pakiet zawiera własnego CPythona 3.12 z zainstalowanymi numpy, OpenCV,
+OpenVINO i SciPy, więc jest niezależny zarówno od Pythona systemowego, jak i od
+Pythona wbudowanego w GIMP-a (który jest w innej wersji i nie rozwiązuje tych
+zależności). Instalacja kopiuje wtyczkę do GIMP-a i wskazuje jej interpreter z
+pakietu.
+
+Dwie rzeczy warte wiedzenia:
+
+- **Nie kasuj pliku po instalacji.** AppImage *jest* interpreterem, który wywołuje
+  GIMP, a na Windowsie trzyma go katalog instalacyjny. AppImage można przenieść —
+  wystarczy uruchomić go ponownie z nowego miejsca.
+- **AppImage wymaga FUSE**, jak każdy AppImage. Na systemie bez FUSE użyj
+  `.tar.gz`.
+
+Pełna instrukcja dla użytkownika jest w środku każdego pakietu jako
+`INSTALL_PL.md` / `INSTALL_EN.md`, a w repozytorium leży w
+`packaging/bundle_files/`.
 
 ### Dla programistów — ze źródeł
 
@@ -123,9 +136,23 @@ python packaging/build_bundle.py --target linux
 python packaging/build_bundle.py --with-models   # z modelami w środku (~686 MB)
 ```
 
+Oba pakiety offline powstają na bazie tego katalogu roboczego, więc najpierw
+trzeba go zbudować z `--with-models --no-archive`:
+
+```bash
+python packaging/build_appimage.py               # → dist/DepthForge-x.y.z-x86_64.AppImage
+python packaging/build_installer.py              # → dist/…-windows-x86_64-setup.exe
+python packaging/assets/make_icon.py             # przegenerowanie ikony (jest w repo)
+```
+
+`build_installer.py` uruchamia Inno Setup pod wine w kontenerze
+`amake/innosetup`, więc wymaga podmana albo dockera — ale nie wine w systemie.
+
 Build linuksowy weryfikuje sam siebie, przepuszczając prawdziwy pipeline
-taktylny przez dołączony interpreter. Builda windowsowego nie da się uruchomić
-na Linuksie, więc z założenia pozostaje nieprzetestowany.
+taktylny przez dołączony interpreter, a build AppImage dodatkowo sprawdza
+zapisaną konfigurację wtyczki. Ani pakiet windowsowy, ani plik .exe nie dają się
+uruchomić na Linuksie, więc z założenia pozostają nieprzetestowane — instalator
+trzeba odpalić na prawdziwym Windowsie przed wydaniem.
 
 ---
 

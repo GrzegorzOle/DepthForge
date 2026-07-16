@@ -45,7 +45,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BUNDLE_FILES = Path(__file__).resolve().parent / "bundle_files"
 DIST_DIR = PROJECT_ROOT / "dist"
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 
 # python-build-standalone: relocatable CPython, identical layout story on both
 # platforms. Pinned on purpose — "latest" would make builds unreproducible.
@@ -401,6 +401,22 @@ def verify_linux_bundle(staging: Path, with_models: bool) -> None:
                     "bundled runtime failed the end-to-end pipeline run:\n"
                     + r.stderr[-3000:]
                 )
+
+            # An STL alone proves nothing: with the models missing the pipeline
+            # silently drops to the synthetic estimator and still exits 0. The
+            # midas/dpt tasks are only scheduled when their OpenVINO models
+            # compile, so their labels are the real proof.
+            expected = ("OpenVINO DPT Large", "OpenVINO MiDaS v2.1 Small")
+            missing = [lbl for lbl in expected if f"✓ {lbl}" not in r.stdout]
+            if missing and (with_models or borrowed):
+                raise SystemExit(
+                    f"models were available but {', '.join(missing)} never ran — "
+                    "the bundle fell back to the synthetic estimator.\n\n"
+                    + r.stdout[-2500:]
+                )
+            if not missing:
+                log("verified: OpenVINO DPT Large + MiDaS both ran (real weights)")
+
             stl = [f for f in os.listdir(tmp) if f.endswith(".stl")]
             if not stl:
                 raise SystemExit(f"pipeline produced no STL:\n{r.stdout[-2000:]}")

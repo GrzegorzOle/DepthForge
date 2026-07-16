@@ -13,6 +13,28 @@ use GIMP's Python at all.
 
 ---
 
+## 0. Which file did you download?
+
+DepthForge comes in several shapes. Find yours — the first two do everything for
+you, and you can stop reading after this section.
+
+| File | What to do | Models |
+|---|---|---|
+| `…-setup.exe` | Run it and follow the wizard. It installs the plugin for you. | inside |
+| `…-x86_64.AppImage` | `chmod +x` it, then run it. It installs the plugin for you. | inside |
+| `…-windows-x86_64.zip` | Unpack, then follow section 2 below. | downloaded during install |
+| `…-linux-x86_64.tar.gz` | Unpack, then follow section 2 below. | downloaded during install |
+
+Whichever you picked: **keep the file or folder where it is** after installing.
+GIMP will call the Python inside it every time you use the plugin. Moving it is
+fine — just run the installer (or the AppImage) once more from the new location.
+
+The AppImage needs **FUSE**, like every AppImage. If it refuses to start with a
+message about `libfuse` or `fusermount`, either install your distribution's
+FUSE 2 package or use the `.tar.gz` instead.
+
+---
+
 ## 1. What you need
 
 | | |
@@ -20,7 +42,7 @@ use GIMP's Python at all.
 | **GIMP** | version 3.2 or newer |
 | **System** | Windows 10/11 64-bit **or** Linux 64-bit (glibc 2.28+: Ubuntu 20.04+, Debian 10+, Fedora 29+) |
 | **Disk space** | about 1.5 GB (package + models) |
-| **Internet** | only during installation — the installer downloads the models (~686 MB) |
+| **Internet** | only for the `.zip` / `.tar.gz` packages, which download the models (~686 MB) during installation. The `.exe` and `.AppImage` carry the models inside and install fully offline. |
 | **RAM** | 4 GB minimum, 8 GB recommended |
 
 Everything runs on the CPU. No graphics card required.

@@ -61,22 +61,34 @@ pip install -e ".[convert]"   # PyTorch + transformers
 ### For GIMP users — the standalone bundle (recommended)
 
 If you only want the GIMP plugin, you do **not** need Python, a virtualenv, or
-this repository. Download the bundle for your system from the
-[Releases page](https://github.com/GrzegorzOle/DepthForge/releases/latest),
-unpack it somewhere permanent, and run one command:
+this repository. Pick one file from the
+[Releases page](https://github.com/GrzegorzOle/DepthForge/releases/latest):
 
-| Platform | Download | Install |
-|---|---|---|
-| Linux x86_64 (glibc 2.28+) | `DepthForge-0.1.0-linux-x86_64.tar.gz` | `./install.sh` |
-| Windows 10/11 64-bit | `DepthForge-0.1.0-windows-x86_64.zip` | double-click `install.bat` |
+| Platform | Download | Install | Models |
+|---|---|---|---|
+| Windows 10/11 64-bit | `DepthForge-0.1.3-windows-x86_64-setup.exe` | run it | included |
+| Linux x86_64 (glibc 2.28+) | `DepthForge-0.1.3-x86_64.AppImage` | `chmod +x` then run it | included |
+| Either, without the models | `…-linux-x86_64.tar.gz` / `…-windows-x86_64.zip` | `./install.sh` / `install.bat` | downloaded on install |
 
-The bundle ships its own CPython 3.12 with numpy, OpenCV, OpenVINO and SciPy
+The first two are **offline** packages: they carry the OpenVINO models (~686 MB)
+inside, so installation needs no internet at all. The archives are smaller but
+fetch the models during install.
+
+Every package ships its own CPython 3.12 with numpy, OpenCV, OpenVINO and SciPy
 pre-installed, so it is independent of both your system Python and GIMP's
 bundled one (which is a different version and cannot resolve these
-dependencies). The installer copies the plugin into GIMP, points it at the
-bundled interpreter, and downloads the models.
+dependencies). Installing copies the plugin into GIMP and points it at the
+bundled interpreter.
 
-Full end-user instructions ship inside the bundle as `INSTALL_EN.md` /
+Two things worth knowing:
+
+- **Keep the file.** The AppImage *is* the interpreter GIMP calls, and the
+  Windows install directory holds it — so do not delete either after installing.
+  Moving the AppImage is fine; just run it again from its new location.
+- **The AppImage needs FUSE**, like any AppImage. On a system without it, use the
+  `.tar.gz` instead.
+
+Full end-user instructions ship inside every package as `INSTALL_EN.md` /
 `INSTALL_PL.md`, and live in the repository under `packaging/bundle_files/`.
 
 ### For developers — from source
@@ -125,9 +137,23 @@ python packaging/build_bundle.py --target linux
 python packaging/build_bundle.py --with-models   # embed the models (~686 MB)
 ```
 
-The Linux build verifies itself by running the real tactile pipeline through
-the bundled interpreter; the Windows build cannot be executed on Linux and is
-therefore unverified by construction.
+The two offline packages are built on top of that staging tree, so build it
+first with `--with-models --no-archive`:
+
+```bash
+python packaging/build_appimage.py               # → dist/DepthForge-x.y.z-x86_64.AppImage
+python packaging/build_installer.py              # → dist/…-windows-x86_64-setup.exe
+python packaging/assets/make_icon.py             # regenerate the icon (committed)
+```
+
+`build_installer.py` runs Inno Setup under wine in the `amake/innosetup`
+container, so it needs podman or docker — but not wine on the host.
+
+The Linux build verifies itself by running the real tactile pipeline through the
+bundled interpreter, and the AppImage build additionally asserts the plugin
+wiring it writes. Neither the Windows bundle nor the .exe can be executed on
+Linux, so both are unverified by construction — run the installer on real
+Windows before shipping it.
 
 ---
 

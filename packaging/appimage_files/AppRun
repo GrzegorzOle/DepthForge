@@ -1,0 +1,49 @@
+#!/bin/sh
+# DepthForge AppRun — a Python interpreter in AppImage clothing.
+#
+# The GIMP plugin runs `subprocess.run([venv_python, helper.py, ...])`, so the
+# AppImage is registered as venv_python and simply forwards its arguments to the
+# bundled interpreter. That is why this is an argv passthrough and not a launcher:
+# `DepthForge.AppImage foo.py a b` must behave exactly like `python3 foo.py a b`.
+#
+# The state-dir symlink below is load-bearing. The plugin resolves project_root
+# (and checks config.json exists there) *before* it execs us, so project_root has
+# to be a stable path — but our mountpoint is a fresh /tmp/.mount_XXXXXX every
+# run. So project_root points at a small real directory whose src/ and models/
+# are symlinks through _appdir, and we re-aim _appdir at the current mount here,
+# before the interpreter starts. Refreshing it later would be too late.
+
+set -eu
+
+SELF="$(readlink -f "$0")"
+APPDIR="${APPDIR:-$(dirname "$SELF")}"
+STATE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/DepthForge"
+
+if [ -d "$STATE_DIR" ]; then
+    ln -sfn "$APPDIR" "$STATE_DIR/_appdir" 2>/dev/null || true
+fi
+
+PYTHON="$APPDIR/python/bin/python3"
+
+# No arguments means a desktop/double-click launch, not a plugin call — running
+# a bare REPL there would look like a crash, so install instead.
+if [ "$#" -eq 0 ]; then
+    exec "$PYTHON" "$APPDIR/appimage_install.py"
+fi
+
+case "$1" in
+    --df-install)
+        shift
+        exec "$PYTHON" "$APPDIR/appimage_install.py" "$@"
+        ;;
+    --df-uninstall)
+        shift
+        exec "$PYTHON" "$APPDIR/appimage_install.py" --uninstall "$@"
+        ;;
+    --df-cli)
+        shift
+        exec "$PYTHON" "$APPDIR/app/src/depth_pipeline.py" "$@"
+        ;;
+esac
+
+exec "$PYTHON" "$@"
