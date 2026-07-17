@@ -45,7 +45,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BUNDLE_FILES = Path(__file__).resolve().parent / "bundle_files"
 DIST_DIR = PROJECT_ROOT / "dist"
 
-VERSION = "0.1.5"
+VERSION = "1.6.0"
 
 # python-build-standalone: relocatable CPython, identical layout story on both
 # platforms. Pinned on purpose — "latest" would make builds unreproducible.

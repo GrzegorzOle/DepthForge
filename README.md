@@ -42,12 +42,16 @@ The workflow is two-stage:
 
 ## Requirements
 
+- **GIMP 3.2 or newer** — only for the plugin. The CLI pipeline does not need GIMP at all.
 - Python 3.10+
 - NumPy
 - OpenCV (opencv-contrib-python)
 - OpenVINO
 - SciPy
 - numpy-stl
+
+Installing from a standalone bundle? Then GIMP 3.2+ is the *only* thing you need —
+everything below it ships inside the package.
 
 Optional — only needed to convert the models yourself (`convert.py`, DPT → ONNX).
 The pipeline never imports these, and the CUDA wheels add ~2 GB:
@@ -61,13 +65,13 @@ pip install -e ".[convert]"   # PyTorch + transformers
 ### For GIMP users — the standalone bundle (recommended)
 
 If you only want the GIMP plugin, you do **not** need Python, a virtualenv, or
-this repository. Pick one file from the
-[Releases page](https://github.com/GrzegorzOle/DepthForge/releases/latest):
+this repository — just **GIMP 3.2 or newer**, installed first. Pick one file from
+the [Releases page](https://github.com/GrzegorzOle/DepthForge/releases/latest):
 
 | Platform | Download | Install | Models |
 |---|---|---|---|
-| Windows 10/11 64-bit | `DepthForge-0.1.5-windows-x86_64-setup.exe` | run it | included |
-| Linux x86_64 (glibc 2.28+) | `DepthForge-0.1.5-x86_64.AppImage` | `chmod +x` then run it | included |
+| Windows 10/11 64-bit | `DepthForge-1.6.0-windows-x86_64-setup.exe` | run it | included |
+| Linux x86_64 (glibc 2.28+) | `DepthForge-1.6.0-x86_64.AppImage` | `chmod +x` then run it | included |
 | Either, without the models | `…-linux-x86_64.tar.gz` / `…-windows-x86_64.zip` | `./install.sh` / `install.bat` | downloaded on install |
 
 The first two are **offline** packages: they carry the OpenVINO models (~686 MB)
