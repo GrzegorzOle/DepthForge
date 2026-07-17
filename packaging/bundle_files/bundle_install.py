@@ -37,6 +37,10 @@ from pathlib import Path
 BUNDLE_ROOT = Path(__file__).resolve().parent
 PLUGIN_FOLDER_NAME = "depthforge"
 
+# The plugin targets the GIMP 3.x API and is tested against 3.2.x. Older 3.0 is
+# untested, 2.x cannot load it at all.
+MIN_GIMP = (3, 2)
+
 
 # ── Console encoding ─────────────────────────────────────────────────────────
 # On Windows our stdout is a file the Inno [Code] section reads back with
@@ -110,15 +114,19 @@ def gimp_config_base() -> Path:
     return Path(xdg) / "GIMP"
 
 
-def find_gimp_plugin_dir(explicit: str | None) -> tuple[Path, bool]:
-    """Return (plug-ins dir, existed_already).
+def find_gimp_plugin_dir(explicit: str | None) -> tuple[Path, bool, tuple[int, ...] | None]:
+    """Return (plug-ins dir, existed_already, detected version or None).
 
     GIMP 3.2 keeps its user config in <base>/3.2/. We prefer the highest
     version directory that actually exists, and fall back to 3.2 (creating it)
     when GIMP has never been launched.
+
+    The version is taken from the config directory name, so it is major.minor
+    only and says nothing about the patch level. It is None when we did not read
+    it off a real directory: an explicit --gimp-dir, or no config dir at all.
     """
     if explicit:
-        return Path(explicit).expanduser() / "plug-ins", True
+        return Path(explicit).expanduser() / "plug-ins", True, None
 
     base = gimp_config_base()
     if base.is_dir():
@@ -131,9 +139,39 @@ def find_gimp_plugin_dir(explicit: str | None) -> tuple[Path, bool]:
                     continue
         if versions:
             versions.sort(reverse=True)
-            return versions[0][1] / "plug-ins", True
+            found, d = versions[0]
+            return d / "plug-ins", True, tuple(found)
 
-    return base / "3.2" / "plug-ins", False
+    return base / "3.2" / "plug-ins", False, None
+
+
+def check_gimp_version(existed: bool, found: tuple[int, ...] | None) -> None:
+    """Report the detected GIMP version. Warns; never aborts.
+
+    Aborting on "no GIMP" would be wrong twice over. The config directory only
+    appears once GIMP has been *launched*, so a freshly installed GIMP has none
+    — and installing DepthForge before GIMP is a supported flow, which the .iss
+    covers with its "Install GIMP plugin" Start menu shortcut. So the worst case
+    here is a warning plus a plugin waiting in a directory GIMP will read later.
+    """
+    want = ".".join(str(x) for x in MIN_GIMP)
+
+    if found is None:
+        if not existed:
+            warn(f"no existing GIMP config found - assuming GIMP {want}.")
+            warn("That is normal if GIMP is installed but has never been started,")
+            warn("or if you are installing DepthForge first. If GIMP is already")
+            warn("running a different version, re-run with")
+            warn("  --gimp-dir <path to your GIMP config dir>")
+        return
+
+    shown = ".".join(str(x) for x in found)
+    if found < MIN_GIMP:
+        warn(f"found GIMP {shown}, but this plugin needs {want} or newer.")
+        warn("Installing anyway, but GIMP will most likely not show it under")
+        warn("Filters. Install GIMP 3.2+ and run this installer again.")
+    else:
+        ok(f"GIMP {shown} detected")
 
 
 # ── Install steps ────────────────────────────────────────────────────────────
@@ -261,7 +299,7 @@ def main() -> None:
     print(f"  bundled Python {manifest.get('python_version', '?')}")
     print("=" * 64)
 
-    plugin_dir, existed = find_gimp_plugin_dir(args.gimp_dir)
+    plugin_dir, existed, gimp_version = find_gimp_plugin_dir(args.gimp_dir)
 
     if args.uninstall:
         section("Uninstalling")
@@ -270,10 +308,7 @@ def main() -> None:
 
     section("GIMP")
     info(f"plug-ins directory: {plugin_dir}")
-    if not existed:
-        warn("no existing GIMP config found - assuming GIMP 3.2.")
-        warn("If GIMP is installed but uses another version, re-run with")
-        warn("  --gimp-dir <path to your GIMP config dir>")
+    check_gimp_version(existed, gimp_version)
 
     section("Plugin")
     dest = install_plugin(plugin_dir)

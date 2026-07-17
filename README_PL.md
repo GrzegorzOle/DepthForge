@@ -72,8 +72,8 @@ wcześniej. Wybierz jeden plik ze
 
 | Platforma | Plik do pobrania | Instalacja | Modele |
 |---|---|---|---|
-| Windows 10/11 64-bit | `DepthForge-1.6.0-windows-x86_64-setup.exe` | uruchom | w środku |
-| Linux x86_64 (glibc 2.28+) | `DepthForge-1.6.0-x86_64.AppImage` | `chmod +x` i uruchom | w środku |
+| Windows 10/11 64-bit | `DepthForge-1.7.0-windows-x86_64-setup.exe` | uruchom | w środku |
+| Linux x86_64 (glibc 2.28+) | `DepthForge-1.7.0-x86_64.AppImage` | `chmod +x` i uruchom | w środku |
 | Dowolna, bez modeli | `…-linux-x86_64.tar.gz` / `…-windows-x86_64.zip` | `./install.sh` / `install.bat` | pobierane przy instalacji |
 
 Dwa pierwsze to pakiety **offline** — niosą modele OpenVINO (~686 MB) w środku,
