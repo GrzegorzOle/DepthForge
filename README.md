@@ -66,8 +66,8 @@ this repository. Pick one file from the
 
 | Platform | Download | Install | Models |
 |---|---|---|---|
-| Windows 10/11 64-bit | `DepthForge-0.1.3-windows-x86_64-setup.exe` | run it | included |
-| Linux x86_64 (glibc 2.28+) | `DepthForge-0.1.3-x86_64.AppImage` | `chmod +x` then run it | included |
+| Windows 10/11 64-bit | `DepthForge-0.1.5-windows-x86_64-setup.exe` | run it | included |
+| Linux x86_64 (glibc 2.28+) | `DepthForge-0.1.5-x86_64.AppImage` | `chmod +x` then run it | included |
 | Either, without the models | `…-linux-x86_64.tar.gz` / `…-windows-x86_64.zip` | `./install.sh` / `install.bat` | downloaded on install |
 
 The first two are **offline** packages: they carry the OpenVINO models (~686 MB)

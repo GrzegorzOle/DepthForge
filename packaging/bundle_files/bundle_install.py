@@ -38,6 +38,28 @@ BUNDLE_ROOT = Path(__file__).resolve().parent
 PLUGIN_FOLDER_NAME = "depthforge"
 
 
+# ── Console encoding ─────────────────────────────────────────────────────────
+# On Windows our stdout is a file the Inno [Code] section reads back with
+# LoadStringsFromFile, i.e. as ANSI, so Python encodes it in the locale code page
+# (cp1250 on a Polish install). A character outside that page raises
+# UnicodeEncodeError mid-print and kills the installer. Degrade to '?' instead --
+# here and, via PYTHONIOENCODING, in download_models.py and every other child.
+# Do not switch these streams to UTF-8: Inno would render the log as mojibake.
+# Keep this module's own output ASCII-only regardless; this is the safety net for
+# paths and tracebacks we do not control.
+def _harden_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+    # ":replace" overrides only the error handler, leaving the encoding alone.
+    os.environ.setdefault("PYTHONIOENCODING", ":replace")
+
+
+_harden_stdio()
+
+
 # ── Pretty output ────────────────────────────────────────────────────────────
 
 def ok(msg: str) -> None:
@@ -65,7 +87,7 @@ def section(msg: str) -> None:
 def read_manifest() -> dict:
     path = BUNDLE_ROOT / "bundle.json"
     if not path.is_file():
-        fail(f"bundle.json missing at {path} — is this an unpacked DepthForge bundle?")
+        fail(f"bundle.json missing at {path} - is this an unpacked DepthForge bundle?")
         sys.exit(1)
     with open(path, encoding="utf-8") as f:
         return json.load(f)
@@ -130,7 +152,7 @@ def install_plugin(plugin_dir: Path) -> Path:
         shutil.rmtree(dest)
 
     shutil.copytree(src, dest)
-    ok(f"plugin copied → {dest}")
+    ok(f"plugin copied -> {dest}")
 
     if platform.system() != "Windows":
         main_script = dest / "depthforge.py"
@@ -151,7 +173,7 @@ def write_install_json(dest_plugin_dir: Path, app_root: Path) -> None:
     path = dest_plugin_dir / "depthforge_install.json"
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
-    ok(f"depthforge_install.json → {path}")
+    ok(f"depthforge_install.json -> {path}")
     info(f"project_root = {data['project_root']}")
     info(f"python       = {data['venv_python']}")
 
@@ -197,7 +219,7 @@ def verify(app_root: Path) -> bool:
     )
     r = subprocess.run(
         [str(bundled_python()), "-c", code],
-        capture_output=True, text=True, cwd=str(app_root),
+        capture_output=True, text=True, errors="replace", cwd=str(app_root),
     )
     if r.returncode != 0:
         fail("verification failed:")
@@ -215,7 +237,7 @@ def uninstall(plugin_dir: Path) -> None:
         ok(f"removed {dest}")
     else:
         info(f"nothing installed at {dest}")
-    info("The bundle folder itself was left untouched — delete it manually to")
+    info("The bundle folder itself was left untouched - delete it manually to")
     info("reclaim the disk space.")
 
 
@@ -235,7 +257,7 @@ def main() -> None:
     app_root = (BUNDLE_ROOT / manifest.get("app_root", "app")).resolve()
 
     print("=" * 64)
-    print(f"  DepthForge {manifest.get('version', '?')} – {manifest.get('platform', '?')}")
+    print(f"  DepthForge {manifest.get('version', '?')} - {manifest.get('platform', '?')}")
     print(f"  bundled Python {manifest.get('python_version', '?')}")
     print("=" * 64)
 
@@ -249,7 +271,7 @@ def main() -> None:
     section("GIMP")
     info(f"plug-ins directory: {plugin_dir}")
     if not existed:
-        warn("no existing GIMP config found — assuming GIMP 3.2.")
+        warn("no existing GIMP config found - assuming GIMP 3.2.")
         warn("If GIMP is installed but uses another version, re-run with")
         warn("  --gimp-dir <path to your GIMP config dir>")
 
@@ -259,14 +281,14 @@ def main() -> None:
 
     section("Models")
     if models_present(app_root):
-        ok("models already present in the bundle — nothing to download")
+        ok("models already present in the bundle - nothing to download")
     elif args.skip_models:
-        warn("skipped on request — the plugin will fall back to the synthetic")
+        warn("skipped on request - the plugin will fall back to the synthetic")
         warn("estimator (flat, low-quality depth) until you run:")
         warn(f"  {bundled_python()} {app_root / 'download_models.py'}")
     else:
         if not download_models(app_root, manifest.get("model_release", "v0.1.0")):
-            fail("model download failed — check your internet connection and re-run.")
+            fail("model download failed - check your internet connection and re-run.")
             fail("The plugin is installed but will produce poor depth maps until")
             fail("the models are in place.")
             sys.exit(1)
@@ -278,7 +300,7 @@ def main() -> None:
 
     section("Done")
     print("  Restart GIMP, open an image, then:")
-    print("    Filters → DepthForge → Generate Depth Map…")
+    print("    Filters > DepthForge > Generate Depth Map...")
     print()
     print(f"  IMPORTANT: do not move or delete this folder:")
     print(f"    {BUNDLE_ROOT}")

@@ -15,6 +15,18 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
+# The progress bar and status marks below are non-ASCII. On Windows this script
+# runs with stdout redirected to a file (the bundle installer, the Inno [Code]
+# section), so Python encodes it in the locale code page -- cp1250 on a Polish
+# install, which has no U+2192/U+2713/U+2588. Printing one there raises
+# UnicodeEncodeError and aborts the download. Degrade to '?' rather than strip
+# the marks: stdout is UTF-8 everywhere else and renders them fine.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 # ── Release configuration ────────────────────────────────────────────────────
 GITHUB_REPO    = "GrzegorzOle/DepthForge"
 DEFAULT_RELEASE = "v0.1.0"

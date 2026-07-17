@@ -20,7 +20,7 @@
   #define AppVersion "0.0.0"
 #endif
 #ifndef SourceDir
-  #define SourceDir "..\..\dist\staging\DepthForge-0.1.3-windows-x86_64-offline"
+  #define SourceDir "..\..\dist\staging\DepthForge-0.1.5-windows-x86_64-offline"
 #endif
 #ifndef OutputDir
   #define OutputDir "..\..\dist"
