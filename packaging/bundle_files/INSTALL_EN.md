@@ -57,7 +57,7 @@ Extract the archive somewhere it can **stay permanently**:
 
 * **Windows** — right-click the `.zip` → *Extract All…*
   A good location: `C:\DepthForge`
-* **Linux** — `tar -xzf DepthForge-0.1.0-linux-x86_64.tar.gz`
+* **Linux** — `tar -xzf DepthForge-<version>-linux-x86_64.tar.gz`
   A good location: `~/DepthForge` or `/opt/DepthForge`
 
 > ⚠️ **This matters:** GIMP will reach into this folder for its Python.
@@ -198,7 +198,7 @@ manually to reclaim the disk space.
 ## 6. What's inside
 
 ```
-DepthForge-0.1.0-<platform>/
+DepthForge-<version>-<platform>/
 ├── install.sh / install.bat        ← the one thing you run
 ├── uninstall.sh / uninstall.bat
 ├── python/                          Python 3.12 + numpy, OpenCV, OpenVINO, SciPy

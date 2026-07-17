@@ -57,7 +57,7 @@ Wypakuj archiwum w miejscu, gdzie ma **zostać na stałe**:
 
 * **Windows** — kliknij plik `.zip` prawym przyciskiem → *Wyodrębnij wszystkie…*
   Dobre miejsce: `C:\DepthForge`
-* **Linux** — `tar -xzf DepthForge-0.1.0-linux-x86_64.tar.gz`
+* **Linux** — `tar -xzf DepthForge-<wersja>-linux-x86_64.tar.gz`
   Dobre miejsce: `~/DepthForge` lub `/opt/DepthForge`
 
 > ⚠️ **To ważne:** GIMP będzie sięgał do Pythona wewnątrz tego folderu.
@@ -200,7 +200,7 @@ To usuwa wtyczkę z GIMP-a. Sam folder pakietu zostaje — skasuj go ręcznie,
 ## 6. Co jest w środku
 
 ```
-DepthForge-0.1.0-<platforma>/
+DepthForge-<wersja>-<platforma>/
 ├── install.sh / install.bat        ← uruchamiasz to
 ├── uninstall.sh / uninstall.bat
 ├── python/                          Python 3.12 + numpy, OpenCV, OpenVINO, SciPy
