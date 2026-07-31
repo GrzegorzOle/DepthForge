@@ -1,0 +1,114 @@
+# Builds the four end-user artifacts and attaches them to an existing GitHub
+# release.
+#
+# Everything is cross-built from Linux, exactly as packaging/ already assumes:
+# the Windows installer is compiled by Inno Setup under wine in a container, and
+# the Windows bundle is assembled with `pip install --target --platform
+# win_amd64`. No Windows runner is involved, and none would help - build_bundle.py
+# is the single place that assembles a runtime and it only runs here.
+#
+# The .exe is therefore **unverified by construction**: nothing in this job can
+# execute it. Run it on real Windows before treating a release as done. The
+# AppImage, by contrast, self-tests - build_appimage.py installs it into a
+# throwaway HOME and runs the real tactile pipeline through it.
+
+name: Release artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build and upload to (e.g. v1.7.1)'
+        required: true
+        type: string
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: echo "name=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.name }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # The artifact names come from build_bundle.VERSION, not from the tag, so a
+      # mismatch would silently upload 1.7.1 files to a v1.8.0 release.
+      - name: Check the tag matches packaging/build_bundle.py VERSION
+        run: |
+          version=$(python -c "import sys; sys.path.insert(0, 'packaging'); import build_bundle; print(build_bundle.VERSION)")
+          echo "build_bundle.VERSION = $version, tag = ${{ steps.tag.outputs.name }}"
+          test "v$version" = "${{ steps.tag.outputs.name }}" || {
+            echo "::error::tag ${{ steps.tag.outputs.name }} does not match VERSION $version"
+            exit 1
+          }
+          echo "version=$version" >> "$GITHUB_ENV"
+
+      - name: Disk space before
+        run: df -h /
+
+      # ~686 MB of weights plus two 1.3 GB staging trees; the offline ones are
+      # deleted as soon as the artifact built from them exists.
+      - name: Build the model-less archives (.zip and .tar.gz)
+        run: python packaging/build_bundle.py --target both
+
+      - name: Build the Windows offline bundle
+        run: python packaging/build_bundle.py --target windows --with-models --no-archive
+
+      # iscc runs as the image's uid 1000 while dist/ belongs to the runner, so
+      # the container cannot write the .exe into it. That failure surfaces late
+      # and cryptically as "Error 5: Access denied" - the docker-side mirror of
+      # the --userns=keep-id problem build_installer.py documents for podman.
+      - name: Make dist/ writable by the container
+        run: chmod -R a+rwX dist
+
+      - name: Compile the Windows installer
+        run: python packaging/build_installer.py --engine docker
+
+      - name: Drop the Windows staging tree
+        run: rm -rf "dist/staging/DepthForge-${version}-windows-x86_64-offline"
+
+      - name: Build the Linux offline bundle
+        run: python packaging/build_bundle.py --target linux --with-models --no-archive
+
+      # No FUSE on the runner: the AppImage runtime honours this and self-extracts
+      # instead, which keeps build_appimage.py's end-to-end verification working.
+      - name: Build and verify the AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+        run: python packaging/build_appimage.py
+
+      - name: Drop the Linux staging tree
+        run: rm -rf "dist/staging/DepthForge-${version}-linux-x86_64-offline"
+
+      - name: Disk space after
+        run: df -h /
+
+      - name: List what was built
+        run: ls -lh dist/ | grep -v '^total'
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ steps.tag.outputs.name }}" \
+            dist/DepthForge-${version}-*.exe \
+            dist/DepthForge-${version}-*.AppImage \
+            dist/DepthForge-${version}-*.zip \
+            dist/DepthForge-${version}-*.tar.gz \
+            dist/DepthForge-${version}-*.sha256 \
+            --clobber
