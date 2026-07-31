@@ -379,8 +379,22 @@ def verify_linux_bundle(staging: Path, with_models: bool) -> None:
         models_dir.symlink_to(PROJECT_ROOT / "models")
         borrowed = True
 
-    if not (models_dir / "dpt" / "openvino" / "dpt_large.xml").is_file():
-        log("WARN: no models available — skipping the end-to-end pipeline check")
+    # Test for the weights, not the topology. The .xml files are small enough to
+    # be tracked in git and only the .bin are gitignored, so a fresh checkout has
+    # half a model — enough to look present here, not enough for OpenVINO to
+    # compile. Checking the .xml made CI "borrow" that half, fall through to the
+    # synthetic estimator, and then fail the assertion below, blaming the bundle
+    # for a missing download.
+    weights = [models_dir / "dpt" / "openvino" / "dpt_large.bin",
+               models_dir / "midas" / "openvino" / "midas_v21_small_256.bin"]
+    if not all(w.is_file() for w in weights):
+        # Undo the borrow before leaving: the cleanup below lives in the try's
+        # finally, which this return never reaches, and a model-less bundle must
+        # not ship a dangling app/models symlink into the build machine.
+        if borrowed:
+            models_dir.unlink()
+        log("WARN: no model weights available — skipping the end-to-end pipeline")
+        log("      check. Run: python download_models.py")
         return
 
     sample = PROJECT_ROOT / "data" / "museum_sample_input.jpg"

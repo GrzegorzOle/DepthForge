@@ -61,6 +61,13 @@ jobs:
       - name: Disk space before
         run: df -h /
 
+      # Only the .xml topologies are tracked in git; the weights are gitignored
+      # and ship as release assets. --with-models refuses to build without them,
+      # and the Linux self-test borrows them to prove OpenVINO really ran rather
+      # than silently falling back to the synthetic estimator.
+      - name: Download the OpenVINO model weights (~686 MB)
+        run: python download_models.py
+
       # ~686 MB of weights plus two 1.3 GB staging trees; the offline ones are
       # deleted as soon as the artifact built from them exists.
       - name: Build the model-less archives (.zip and .tar.gz)
