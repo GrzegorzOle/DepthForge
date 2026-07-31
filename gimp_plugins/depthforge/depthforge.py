@@ -133,18 +133,21 @@ def _find_project_root() -> str | None:
 def _find_external_python() -> str | None:
     """
     Priority:
-      1. DEPTHFORGE_PYTHON environment variable
-      2. depthforge_install.json  (written by install.py)
+      1. depthforge_install.json  (written by whichever installer wired this copy)
+      2. DEPTHFORGE_PYTHON environment variable  (manual override)
       3. Auto-discovery of project .venv
       4. System Python
-    """
-    # 1. Env var
-    env = os.environ.get("DEPTHFORGE_PYTHON", "").strip()
-    if env and os.path.isfile(env):
-        _log(f"Python found via env var: {env}")
-        return env
 
-    # 2. Install config JSON
+    The install JSON deliberately outranks the environment variable. The JSON
+    sits next to this very file, so it always describes *this* installation,
+    while DEPTHFORGE_PYTHON is machine-wide and outlives the install that set
+    it: a stale value left by an earlier source install used to silently shadow
+    a later bundle install forever, and the symptom surfaced far from the cause
+    (a broken interpreter failing deep inside the helper subprocess).
+    """
+    env = os.environ.get("DEPTHFORGE_PYTHON", "").strip()
+
+    # 1. Install config JSON
     cfg_path = os.path.join(_PLUGIN_DIR, "depthforge_install.json")
     if os.path.isfile(cfg_path):
         try:
@@ -152,10 +155,24 @@ def _find_external_python() -> str | None:
                 data = _json.load(f)
             venv_py = data.get("venv_python", "").strip()
             if venv_py and os.path.isfile(venv_py):
+                if env and os.path.normcase(os.path.abspath(env)) != \
+                        os.path.normcase(os.path.abspath(venv_py)):
+                    _log(f"NOTE: DEPTHFORGE_PYTHON={env} disagrees with the "
+                         f"installed configuration and is being ignored. "
+                         f"Unset it if it is a leftover from an older install.")
                 _log(f"Python found via install JSON: {venv_py}")
                 return venv_py
+            if venv_py:
+                _log(f"Install JSON points at a missing interpreter: {venv_py}")
         except Exception as e:
             _log(f"Could not read install JSON: {e}")
+
+    # 2. Env var override
+    if env:
+        if os.path.isfile(env):
+            _log(f"Python found via env var: {env}")
+            return env
+        _log(f"DEPTHFORGE_PYTHON points at a missing file: {env}")
 
     # 3. Auto-discovery
     root = _find_project_root()
@@ -178,6 +195,31 @@ def _find_external_python() -> str | None:
     if py:
         _log(f"Python found via PATH: {py}")
     return py
+
+
+def _child_env() -> dict:
+    """Environment for every interpreter we spawn.
+
+    GIMP 3.x ships its own Python and may export PYTHONHOME/PYTHONPATH for it.
+    Inheriting those into a *different* interpreter makes it load GIMP's stdlib
+    instead of its own, which surfaces as numpy failing to import its C
+    extensions — the classic "works in a terminal, fails inside GIMP". Strip
+    them so the child resolves its own installation, exactly as it does when
+    launched from a shell.
+
+    PYTHONIOENCODING pairs with the encoding="utf-8" we decode the pipes with:
+    the helper prints Polish, and the default here would be the console code
+    page (cp1250 on a Polish Windows), which mangles or raises on that text.
+    """
+    env = dict(os.environ)
+    for var in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONEXECUTABLE"):
+        env.pop(var, None)
+    env["PYTHONIOENCODING"] = "utf-8"
+    # Second layer under the private helper directory: keep the script's own
+    # directory (and, for -c, the CWD) off sys.path entirely, so nothing there
+    # can shadow a stdlib module. Python 3.11+; older versions ignore it.
+    env["PYTHONSAFEPATH"] = "1"
+    return env
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -236,7 +278,16 @@ try:
     import numpy as np
     import cv2
 except ImportError as e:
-    sys.exit(f"IMPORT_ERROR: {e}")
+    # numpy wraps *any* failure in its own "C-extensions failed" banner, which
+    # says nothing about the real cause. Print the traceback too: it names the
+    # file that actually got imported, which is how a stray module shadowing a
+    # stdlib name becomes obvious instead of mysterious.
+    import traceback
+    sys.stderr.write("IMPORT_ERROR: %s\n\n" % e)
+    sys.stderr.write("executable: %s\n" % sys.executable)
+    sys.stderr.write("sys.path:\n%s\n\n" % "\n".join("  " + p for p in sys.path))
+    traceback.print_exc()
+    sys.exit(1)
 
 img = cv2.imread(input_png)
 if img is None:
@@ -605,7 +656,8 @@ class DepthForgePlugin(Gimp.PlugIn):
             lines.append(f"[OK] External Python:\n     {ext_py}")
         else:
             lines.append("[FAIL] External Python: NOT FOUND")
-            lines.append("       Run install.py or set DEPTHFORGE_PYTHON env var")
+            lines.append("       Re-run the DepthForge installer, or set the")
+            lines.append("       DEPTHFORGE_PYTHON env var by hand")
 
         cfg_path = os.path.join(_PLUGIN_DIR, "depthforge_install.json")
         if os.path.isfile(cfg_path):
@@ -619,7 +671,7 @@ class DepthForgePlugin(Gimp.PlugIn):
                 lines.append(f"[WARN] Install config unreadable: {e}")
         else:
             lines.append(f"[WARN] depthforge_install.json missing:\n     {cfg_path}")
-            lines.append("       Run install.py to create it")
+            lines.append("       Re-run the DepthForge installer to create it")
 
         root = _find_project_root()
         lines.append(f"{'[OK]' if root else '[WARN]'} Project root: {root or 'not found'}")
@@ -629,16 +681,25 @@ class DepthForgePlugin(Gimp.PlugIn):
                 [ext_py, "-c",
                  "import numpy, cv2; print(f'numpy {numpy.__version__}, "
                  "opencv {cv2.__version__}')"],
-                capture_output=True, text=True, timeout=15,
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                env=_child_env(), timeout=15,
             )
             if r.returncode == 0:
                 lines.append(f"[OK] Python deps: {r.stdout.strip()}")
             else:
-                lines.append(f"[FAIL] Python deps:\n{r.stderr.strip()[:300]}")
+                # Tail, not head: the real exception is at the end.
+                lines.append(f"[FAIL] Python deps:\n{r.stderr.strip()[-300:]}")
 
         env_val = os.environ.get("DEPTHFORGE_PYTHON", "")
-        lines.append(f"{'[OK]' if env_val else '[INFO]'} DEPTHFORGE_PYTHON env = "
-                     f"{env_val or '(not set – using install JSON)'}")
+        if not env_val:
+            lines.append("[INFO] DEPTHFORGE_PYTHON env = (not set – using install JSON)")
+        elif ext_py and os.path.normcase(os.path.abspath(env_val)) == \
+                os.path.normcase(os.path.abspath(ext_py)):
+            lines.append(f"[OK] DEPTHFORGE_PYTHON env = {env_val}")
+        else:
+            lines.append(f"[WARN] DEPTHFORGE_PYTHON env = {env_val}")
+            lines.append("       Ignored – the install JSON takes precedence.")
+            lines.append("       Likely a leftover from an older install; unset it.")
 
         lines.append("=" * 40)
         lines.append(f"Log file: {_LOG_FILE}")
@@ -706,18 +767,19 @@ class DepthForgePlugin(Gimp.PlugIn):
         if not ext_python:
             return _make_error(
                 procedure,
-                "DepthForge: nie znaleziono zewnetrznego Pythona z numpy/opencv.\n\n"
-                "Uruchom w PowerShell:\n"
-                "  python H:\\test\\DepthForge\\install.py --yes\n\n"
-                "Lub ustaw zmienna srodowiskowa:\n"
+                "DepthForge: nie znaleziono Pythona z numpy/opencv.\n\n"
+                "Uruchom ponownie instalator DepthForge - zapisuje on obok\n"
+                "wtyczki plik depthforge_install.json ze sciezka do interpretera.\n\n"
+                "Ewentualnie ustaw recznie zmienna srodowiskowa:\n"
                 "  DEPTHFORGE_PYTHON = sciezka\\do\\python.exe\n\n"
-                f"(szukano w: {_PLUGIN_DIR}\\depthforge_install.json)\n"
+                f"(szukano w: {os.path.join(_PLUGIN_DIR, 'depthforge_install.json')})\n"
                 f"Log: {_LOG_FILE}",
             )
 
         Gimp.context_push()
         image.undo_group_start()
         tmp_in = tmp_out = tmp_helper = tmp_color = None
+        tmp_helper_dir = None
 
         # Duplikat obrazu do eksportu (spłaszczony – wszystkie warstwy złożone)
         export_image = None
@@ -866,8 +928,18 @@ class DepthForgePlugin(Gimp.PlugIn):
                 _log(f"STL output path: {stl_out_path}")
 
             # 2. Write helper script
-            tmp_fd, tmp_helper = tempfile.mkstemp(suffix=".py", prefix="df_helper_")
-            with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+            # The helper gets a directory of its own, and this is not tidiness.
+            # Python puts the script's directory first on sys.path, so writing
+            # the helper straight into %TEMP% would put %TEMP% there — a
+            # world-writable folder full of other people's scripts. One stray
+            # inspect.py / types.py / json.py in it shadows the stdlib module of
+            # that name for our process, and the failure surfaces as a baffling
+            # "Importing the numpy C-extensions failed" (this happened: a leftover
+            # %TEMP%\inspect.py that did `import duckdb`). An empty private
+            # directory makes sys.path[0] harmless.
+            tmp_helper_dir = tempfile.mkdtemp(prefix="df_helper_")
+            tmp_helper = os.path.join(tmp_helper_dir, "df_helper.py")
+            with open(tmp_helper, "w", encoding="utf-8") as fh:
                 fh.write(_HELPER_SCRIPT)
 
             # 3. Call external Python
@@ -890,15 +962,28 @@ class DepthForgePlugin(Gimp.PlugIn):
                 str(tactile_levels),
             ]
             _log(f"Subprocess cmd: {' '.join(cmd[:3])} ...")
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-            _log(f"Subprocess exit={result.returncode} stdout={result.stdout[:200]} "
-                 f"stderr={result.stderr[:300]}")
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace",
+                                    env=_child_env(), timeout=180)
+            # Log both streams in full. Truncating here is how the real cause of
+            # an import failure ("Original error was: ...", printed last) got
+            # lost while the generic advice at the top survived.
+            _log(f"Subprocess exit={result.returncode}")
+            if result.stdout.strip():
+                _log("--- helper stdout ---\n" + result.stdout.strip())
+            if result.stderr.strip():
+                _log("--- helper stderr ---\n" + result.stderr.strip())
 
             if result.returncode != 0:
                 detail = (result.stderr or result.stdout or "(no output)").strip()
+                # Show the *tail*: Python puts the actual exception at the end,
+                # and numpy's import banner is 600 characters of preamble.
+                if len(detail) > 700:
+                    detail = "[...]\n" + detail[-700:]
                 raise RuntimeError(
                     f"Zewnetrzny Python zakonczyl sie bledem (kod {result.returncode}):\n\n"
-                    f"{detail[:600]}"
+                    f"{detail}\n\n"
+                    f"Pelne wyjscie w logu: {_LOG_FILE}"
                 )
 
             if not os.path.isfile(tmp_out) or os.path.getsize(tmp_out) == 0:
@@ -990,6 +1075,12 @@ class DepthForgePlugin(Gimp.PlugIn):
                         os.unlink(tmp)
                 except Exception:
                     pass
+            try:
+                if tmp_helper_dir and os.path.isdir(tmp_helper_dir):
+                    import shutil as _sh
+                    _sh.rmtree(tmp_helper_dir, ignore_errors=True)
+            except Exception:
+                pass
             # Usuń spłaszczony duplikat obrazu (żeby nie zaśmiecać listy obrazów GIMP)
             try:
                 if export_image is not None:

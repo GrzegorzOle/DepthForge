@@ -18,8 +18,15 @@ Co robi instalator
 3. Instaluje wszystkie zależności Python (requirements.txt)
 4. Pobiera modele OpenVINO (DPT Large + MiDaS v2.1 Small) – łącznie ~685 MB
 5. Instaluje wtyczkę GIMP 3.x
-6. Ustawia zmienną środowiskową DEPTHFORGE_PYTHON (dla bieżącego użytkownika)
-7. Zapisuje plik konfiguracyjny obok wtyczki GIMP
+6. Zapisuje plik konfiguracyjny depthforge_install.json obok wtyczki GIMP
+7. Usuwa zmienną DEPTHFORGE_PYTHON, jeśli została po starszej wersji
+
+Uwaga o punkcie 7: wcześniejsze wersje *ustawiały* tę zmienną. Ponieważ jest
+ona ogólnosystemowa, przeżywała instalację, która ją wpisała, i przesłaniała
+późniejszą instalację z pakietu (bundle/.exe/AppImage) – GIMP uruchamiał wtedy
+stary, często już nieistniejący lub niesprawny interpreter. Źródłem prawdy jest
+depthforge_install.json leżący obok wtyczki; zmienna została ręcznym nadpisaniem
+o niższym priorytecie i żaden instalator jej już nie ustawia.
 """
 
 import sys
@@ -543,52 +550,18 @@ def install_gimp_plugin(venv_python: Path) -> bool:
         json.dump(config, f, indent=2)
     ok(f"Konfiguracja zapisana: {config_path.name}")
 
-    # Ustaw zmienną środowiskową DEPTHFORGE_PYTHON dla użytkownika
-    _set_user_env("DEPTHFORGE_PYTHON", str(venv_python))
+    # Nie ustawiamy DEPTHFORGE_PYTHON – patrz docstring modułu. Zamiast tego
+    # sprzątamy po starszych wersjach instalatora, które ją wpisywały.
+    _remove_user_env("DEPTHFORGE_PYTHON")
 
     return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Ustawianie zmiennej środowiskowej użytkownika
+#  Usuwanie zmiennej środowiskowej użytkownika
 # ─────────────────────────────────────────────────────────────────────────────
-def _set_user_env(name: str, value: str):
-    """Ustaw zmienną środowiskową na poziomie bieżącego użytkownika (trwale)."""
-    system = platform.system()
-    if system == "Windows":
-        try:
-            import winreg
-            key = winreg.OpenKey(
-                winreg.HKEY_CURRENT_USER, "Environment",
-                0, winreg.KEY_SET_VALUE
-            )
-            winreg.SetValueEx(key, name, 0, winreg.REG_EXPAND_SZ, value)
-            winreg.CloseKey(key)
-            # Powiadom system o zmianie środowiska
-            import ctypes
-            ctypes.windll.user32.SendMessageTimeoutW(
-                0xFFFF, 0x001A, 0, "Environment", 2, 5000, None
-            )
-            ok(f"Zmienna env ustawiona: {name} = {value}")
-        except Exception as e:
-            warn(f"Nie udało się ustawić {name} w rejestrze: {e}")
-            warn(f"Ustaw ręcznie: setx {name} \"{value}\"")
-    else:
-        # Linux/macOS – dописz do ~/.profile i ~/.bashrc
-        line = f'\nexport {name}="{value}"\n'
-        for rc in (Path.home() / ".profile", Path.home() / ".bashrc"):
-            try:
-                content = rc.read_text(encoding="utf-8") if rc.exists() else ""
-                if name not in content:
-                    with open(rc, "a", encoding="utf-8") as f:
-                        f.write(line)
-                    ok(f"Dodano do {rc.name}: export {name}")
-            except Exception:
-                pass
-
-
 def _remove_user_env(name: str):
-    """Usuń zmienną środowiskową użytkownika."""
+    """Usuń trwałą zmienną środowiskową użytkownika (Windows + Linux/macOS)."""
     if platform.system() == "Windows":
         try:
             import winreg
@@ -599,11 +572,32 @@ def _remove_user_env(name: str):
             try:
                 winreg.DeleteValue(key, name)
                 ok(f"Usunięto zmienną: {name}")
+                # Bez tego Explorer (a więc i GIMP) trzyma stary blok środowiska
+                # aż do wylogowania.
+                import ctypes
+                ctypes.windll.user32.SendMessageTimeoutW(
+                    0xFFFF, 0x001A, 0, "Environment", 2, 5000, None
+                )
             except FileNotFoundError:
                 pass
             winreg.CloseKey(key)
         except Exception as e:
             warn(f"Błąd usuwania {name}: {e}")
+        return
+
+    # Linux/macOS – usuń linie `export NAME=...` dopisane przez starsze wersje.
+    for rc in (Path.home() / ".profile", Path.home() / ".bashrc"):
+        try:
+            if not rc.exists():
+                continue
+            lines = rc.read_text(encoding="utf-8").splitlines(keepends=True)
+            kept = [ln for ln in lines
+                    if not ln.lstrip().startswith(f"export {name}=")]
+            if len(kept) != len(lines):
+                rc.write_text("".join(kept), encoding="utf-8")
+                ok(f"Usunięto wpis export {name} z {rc.name}")
+        except Exception as e:
+            warn(f"Nie udało się posprzątać {rc}: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -640,9 +634,13 @@ def print_summary(venv_python: Path | None):
     if venv_python and venv_python.exists():
         ok(f"Python venv:  {venv_python}")
 
+    # Wartość odziedziczona przez *tę* powłokę – rejestr/pliki rc zostały już
+    # posprzątane, ale bieżąca sesja nadal widzi starą wartość.
     env_val = os.environ.get("DEPTHFORGE_PYTHON", "")
-    if env_val:
-        ok(f"DEPTHFORGE_PYTHON = {env_val}")
+    if env_val and (not venv_python or Path(env_val) != venv_python):
+        warn(f"DEPTHFORGE_PYTHON = {env_val} (wartość z bieżącej sesji)")
+        warn("Wpis został usunięty; nowe procesy go nie zobaczą, ale tę powłokę")
+        warn("trzeba otworzyć ponownie. Wtyczka i tak używa depthforge_install.json.")
 
     models_ok = all(m["local_path"].exists() for m in MODELS)
     if models_ok:

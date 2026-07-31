@@ -113,23 +113,69 @@ def read_manifest() -> dict:
 
 # ── GIMP discovery (mirrors bundle_install.py) ───────────────────────────────
 
-def find_gimp_plugin_dir(explicit: str | None) -> tuple[Path, bool]:
+def parse_version(text: str) -> tuple[int, ...] | None:
+    """Leading dotted integers of a version string: '3.2.4 (git)' -> (3, 2, 4)."""
+    parts: list[int] = []
+    for chunk in str(text).strip().split("."):
+        digits = ""
+        for ch in chunk:
+            if not ch.isdigit():
+                break
+            digits += ch
+        if not digits:
+            break
+        parts.append(int(digits))
+        if len(parts) == 3:
+            break
+    return tuple(parts) if parts else None
+
+
+def detect_installed_gimp() -> tuple[tuple[int, ...] | None, str | None]:
+    """Ask the installed GIMP its version, rather than guessing from ~/.config.
+
+    The config directory only appears once GIMP has been launched, so it says
+    nothing about a freshly installed one - and picking the wrong series drops
+    the plugin somewhere GIMP will never read, silently.
+    """
+    exe = shutil.which("gimp-3.0") or shutil.which("gimp-3") or shutil.which("gimp")
+    if not exe:
+        return None, None
+    try:
+        r = subprocess.run([exe, "--version"], capture_output=True, text=True,
+                           errors="replace", timeout=30, env=child_env())
+        for token in (r.stdout or "").split():
+            ver = parse_version(token)
+            if ver and len(ver) >= 2:
+                return ver, exe
+    except Exception:
+        pass
+    return None, exe
+
+
+def find_gimp_plugin_dir(explicit: str | None,
+                         installed: tuple[int, ...] | None) -> tuple[Path, bool]:
     if explicit:
         return Path(explicit).expanduser() / "plug-ins", True
 
     xdg = os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
     base = Path(xdg) / "GIMP"
+    existing: dict[tuple[int, ...], Path] = {}
     if base.is_dir():
-        versions = []
         for d in base.iterdir():
-            if d.is_dir() and d.name[:1].isdigit():
-                try:
-                    versions.append(([int(x) for x in d.name.split(".") if x.isdigit()], d))
-                except ValueError:
-                    continue
-        if versions:
-            versions.sort(reverse=True)
-            return versions[0][1] / "plug-ins", True
+            if not d.is_dir():
+                continue
+            ver = parse_version(d.name)
+            if ver and len(ver) >= 2:
+                existing[ver[:2]] = d
+
+    if installed:
+        want = installed[:2]
+        if want in existing:
+            return existing[want] / "plug-ins", True
+        return base / ".".join(str(x) for x in want) / "plug-ins", False
+
+    if existing:
+        return existing[max(existing)] / "plug-ins", True
 
     return base / "3.2" / "plug-ins", False
 
@@ -206,6 +252,50 @@ def write_install_json(dest_plugin_dir: Path, app_root: Path) -> None:
     info(f"python       = {data['venv_python']}")
 
 
+def clear_stale_env_override(expected: Path) -> None:
+    """Drop a DEPTHFORGE_PYTHON left behind by an older source install.
+
+    Mirrors bundle_install.py. Older versions of install.py appended an
+    ``export DEPTHFORGE_PYTHON=...`` line to the shell rc files; being
+    machine-wide, it outlived the install that wrote it and kept pointing GIMP
+    at an interpreter that no longer exists. Those lines are ours - nothing else
+    writes them - so removing them is safe. Left alone when it already points at
+    this AppImage: that is a deliberate setup, not a leftover.
+    """
+    for rc in (Path.home() / ".profile", Path.home() / ".bashrc"):
+        try:
+            if not rc.is_file():
+                continue
+            lines = rc.read_text(encoding="utf-8").splitlines(keepends=True)
+            kept = [ln for ln in lines
+                    if not ln.lstrip().startswith("export DEPTHFORGE_PYTHON=")
+                    or str(expected) in ln]
+            if len(kept) != len(lines):
+                rc.write_text("".join(kept), encoding="utf-8")
+                info(f"removed stale DEPTHFORGE_PYTHON export from {rc}")
+        except Exception as e:
+            warn(f"could not clean {rc}: {e}")
+
+    current = os.environ.get("DEPTHFORGE_PYTHON", "").strip()
+    if current and os.path.realpath(current) != os.path.realpath(str(expected)):
+        warn(f"DEPTHFORGE_PYTHON={current} is still set in this shell.")
+        warn("Start GIMP from a new shell so it does not inherit the old value.")
+
+
+def child_env() -> dict:
+    """Environment for the interpreters we spawn.
+
+    APPDIR-scoped PYTHONHOME/PYTHONPATH belong to the AppImage runtime, and a
+    user's own global ones belong to some other Python entirely; either way the
+    child must resolve its own installation. Strip them.
+    """
+    env = dict(os.environ)
+    for var in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONEXECUTABLE"):
+        env.pop(var, None)
+    env.setdefault("PYTHONIOENCODING", ":replace")
+    return env
+
+
 def verify(app_root: Path) -> bool:
     """Run the real chain the way the plugin will: through the AppImage itself.
 
@@ -226,7 +316,8 @@ def verify(app_root: Path) -> bool:
     )
     r = subprocess.run(
         [str(appimage_path()), "-c", code],
-        capture_output=True, text=True, cwd=str(app_root),
+        capture_output=True, text=True, errors="replace", cwd=str(app_root),
+        env=child_env(),
     )
     if r.returncode != 0:
         fail("verification failed:")
@@ -272,7 +363,8 @@ def main() -> None:
     print(f"  bundled Python {manifest.get('python_version', '?')}")
     print("=" * 64)
 
-    plugin_dir, existed = find_gimp_plugin_dir(args.gimp_dir)
+    installed_ver, installed_exe = detect_installed_gimp()
+    plugin_dir, existed = find_gimp_plugin_dir(args.gimp_dir, installed_ver)
 
     if args.uninstall:
         section("Uninstalling")
@@ -280,11 +372,20 @@ def main() -> None:
         return
 
     section("GIMP")
-    info(f"plug-ins directory: {plugin_dir}")
-    if not existed:
-        warn("no existing GIMP config found — assuming GIMP 3.2.")
-        warn("If GIMP is installed but uses another version, re-run with")
+    if installed_ver:
+        ok(f"GIMP {'.'.join(str(x) for x in installed_ver)} installed: {installed_exe}")
+    elif installed_exe:
+        ok(f"GIMP found: {installed_exe} (version unreadable)")
+    elif existed:
+        ok("no gimp binary on PATH, but a GIMP config directory exists")
+    else:
+        warn("no GIMP found on this computer — assuming GIMP 3.2.")
+        warn("Install GIMP 3.2+ and re-run with --df-install, or point us at it:")
         warn("  --df-install --gimp-dir <path to your GIMP config dir>")
+    info(f"plug-ins directory: {plugin_dir}")
+    if not existed and (installed_ver or installed_exe):
+        info("GIMP has never been started, so its config directory is being")
+        info("created now. That is normal on a fresh installation.")
 
     section("State directory")
     app_root = build_state_dir()
@@ -292,6 +393,7 @@ def main() -> None:
     section("Plugin")
     dest = install_plugin(plugin_dir)
     write_install_json(dest, app_root)
+    clear_stale_env_override(appimage_path())
 
     section("Models")
     dpt = APPDIR / "app" / "models" / "dpt" / "openvino" / "dpt_large.bin"

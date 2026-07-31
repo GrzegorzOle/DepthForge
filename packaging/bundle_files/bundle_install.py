@@ -6,12 +6,15 @@ DepthForge – bundle installer
 Runs under the CPython interpreter shipped inside this bundle, never under a
 system Python and never under GIMP's. It:
 
-  1. finds GIMP's user plug-ins directory,
+  1. detects the GIMP that is installed (uninstall registry on Windows,
+     `gimp --version` elsewhere) and derives its user plug-ins directory,
   2. copies the depthforge plugin there,
   3. writes depthforge_install.json pointing the plugin at this bundle's
      interpreter and app directory,
-  4. downloads the OpenVINO models (unless already bundled/present),
-  5. verifies that the whole chain actually imports and runs.
+  4. clears a stale DEPTHFORGE_PYTHON left over by an older source install,
+     which would otherwise keep pointing GIMP somewhere else,
+  5. downloads the OpenVINO models (unless already bundled/present),
+  6. verifies that the whole chain actually imports and runs.
 
 The bundle is used *in place*: the paths written into depthforge_install.json
 point back here, so this folder must stay where it is after installation.
@@ -102,6 +105,22 @@ def bundled_python() -> Path:
     return Path(sys.executable).resolve()
 
 
+def child_env() -> dict:
+    """Environment for the interpreters we spawn.
+
+    A globally set PYTHONHOME/PYTHONPATH - left by an old Anaconda, a py
+    launcher tweak, or an embedded runtime - makes our self-contained
+    interpreter load a foreign stdlib and fail while importing numpy's C
+    extensions. Strip them so the bundle is unaffected by whatever Python
+    history the machine has.
+    """
+    env = dict(os.environ)
+    for var in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONEXECUTABLE"):
+        env.pop(var, None)
+    env.setdefault("PYTHONIOENCODING", ":replace")
+    return env
+
+
 # ── GIMP discovery ───────────────────────────────────────────────────────────
 
 def gimp_config_base() -> Path:
@@ -114,64 +133,185 @@ def gimp_config_base() -> Path:
     return Path(xdg) / "GIMP"
 
 
-def find_gimp_plugin_dir(explicit: str | None) -> tuple[Path, bool, tuple[int, ...] | None]:
-    """Return (plug-ins dir, existed_already, detected version or None).
+def parse_version(text: str) -> tuple[int, ...] | None:
+    """Leading dotted integers of a version string: '3.2.4 (git)' -> (3, 2, 4)."""
+    parts: list[int] = []
+    for chunk in str(text).strip().split("."):
+        digits = ""
+        for ch in chunk:
+            if not ch.isdigit():
+                break
+            digits += ch
+        if not digits:
+            break
+        parts.append(int(digits))
+        if len(parts) == 3:
+            break
+    return tuple(parts) if parts else None
 
-    GIMP 3.2 keeps its user config in <base>/3.2/. We prefer the highest
-    version directory that actually exists, and fall back to 3.2 (creating it)
-    when GIMP has never been launched.
 
-    The version is taken from the config directory name, so it is major.minor
-    only and says nothing about the patch level. It is None when we did not read
-    it off a real directory: an explicit --gimp-dir, or no config dir at all.
+def _detect_gimp_windows() -> tuple[tuple[int, ...] | None, str | None]:
+    try:
+        import winreg
+    except ImportError:
+        return None, None
+
+    roots = [
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_LOCAL_MACHINE,
+         r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+    ]
+    best_ver: tuple[int, ...] | None = None
+    best_loc: str | None = None
+
+    for hive, path in roots:
+        try:
+            root = winreg.OpenKey(hive, path)
+        except OSError:
+            continue
+        with root:
+            count = winreg.QueryInfoKey(root)[0]
+            for i in range(count):
+                try:
+                    with winreg.OpenKey(root, winreg.EnumKey(root, i)) as k:
+                        name = str(winreg.QueryValueEx(k, "DisplayName")[0])
+                        if not name.upper().startswith("GIMP"):
+                            continue
+                        try:
+                            ver = parse_version(winreg.QueryValueEx(k, "DisplayVersion")[0])
+                        except OSError:
+                            ver = None
+                        try:
+                            loc = str(winreg.QueryValueEx(k, "InstallLocation")[0]) or None
+                        except OSError:
+                            loc = None
+                except OSError:
+                    continue
+                if ver and (best_ver is None or ver > best_ver):
+                    best_ver, best_loc = ver, loc
+
+    if best_ver:
+        return best_ver, best_loc
+
+    # Portable copies and installs whose uninstall entry we cannot read still
+    # live in one of the two usual places. The folder name carries the major
+    # version only, so the version stays unknown - the location alone is already
+    # enough to say "GIMP is here".
+    for base in (os.environ.get("LOCALAPPDATA", "") and
+                 os.path.join(os.environ["LOCALAPPDATA"], "Programs"),
+                 os.environ.get("ProgramFiles", ""),
+                 os.environ.get("ProgramFiles(x86)", "")):
+        if not base or not os.path.isdir(base):
+            continue
+        for entry in sorted(os.listdir(base), reverse=True):
+            if entry.upper().startswith("GIMP") and \
+                    os.path.isdir(os.path.join(base, entry, "bin")):
+                return None, os.path.join(base, entry)
+    return None, None
+
+
+def _detect_gimp_posix() -> tuple[tuple[int, ...] | None, str | None]:
+    exe = shutil.which("gimp-3.0") or shutil.which("gimp-3") or shutil.which("gimp")
+    if not exe:
+        return None, None
+    try:
+        r = subprocess.run([exe, "--version"], capture_output=True, text=True,
+                           errors="replace", timeout=30, env=child_env())
+        for token in (r.stdout or "").split():
+            ver = parse_version(token)
+            if ver and len(ver) >= 2:
+                return ver, exe
+    except Exception:
+        pass
+    return None, exe
+
+
+def detect_installed_gimp() -> tuple[tuple[int, ...] | None, str | None]:
+    """Find the GIMP that is *installed*, not the config dir it leaves behind.
+
+    The config directory only appears once GIMP has been launched, so on a fresh
+    machine - exactly the machine this installer targets - it says nothing. Ask
+    the system what is installed instead. Getting this wrong is silent and
+    expensive: dropping the plugin into 3.2/ when the user runs GIMP 3.0 leaves
+    a complete, working install that simply never shows up under Filters.
+
+    Returns (version, install location); either part may be None.
+    """
+    if platform.system() == "Windows":
+        return _detect_gimp_windows()
+    return _detect_gimp_posix()
+
+
+def find_gimp_plugin_dir(explicit: str | None,
+                         installed: tuple[int, ...] | None
+                         ) -> tuple[Path, bool, tuple[int, ...] | None]:
+    """Return (plug-ins dir, existed_already, config series we targeted).
+
+    GIMP keeps its user config in <base>/<major>.<minor>/. We aim at the series
+    of the GIMP that is actually installed, creating that directory when GIMP
+    has never been launched. Only when nothing is installed (or we could not
+    tell) do we fall back to the newest config directory present, then to 3.2.
     """
     if explicit:
         return Path(explicit).expanduser() / "plug-ins", True, None
 
     base = gimp_config_base()
+    existing: dict[tuple[int, ...], Path] = {}
     if base.is_dir():
-        versions = []
         for d in base.iterdir():
-            if d.is_dir() and d.name[:1].isdigit():
-                try:
-                    versions.append(([int(x) for x in d.name.split(".") if x.isdigit()], d))
-                except ValueError:
-                    continue
-        if versions:
-            versions.sort(reverse=True)
-            found, d = versions[0]
-            return d / "plug-ins", True, tuple(found)
+            if not d.is_dir():
+                continue
+            ver = parse_version(d.name)
+            if ver and len(ver) >= 2:
+                existing[ver[:2]] = d
+
+    if installed:
+        want = installed[:2]
+        if want in existing:
+            return existing[want] / "plug-ins", True, want
+        name = ".".join(str(x) for x in want)
+        return base / name / "plug-ins", False, want
+
+    if existing:
+        top = max(existing)
+        return existing[top] / "plug-ins", True, top
 
     return base / "3.2" / "plug-ins", False, None
 
 
-def check_gimp_version(existed: bool, found: tuple[int, ...] | None) -> None:
-    """Report the detected GIMP version. Warns; never aborts.
+def report_gimp(installed: tuple[int, ...] | None, location: str | None,
+                existed: bool, series: tuple[int, ...] | None) -> bool:
+    """Say what we found and whether it is good enough. Returns "GIMP is here".
 
-    Aborting on "no GIMP" would be wrong twice over. The config directory only
-    appears once GIMP has been *launched*, so a freshly installed GIMP has none
-    — and installing DepthForge before GIMP is a supported flow, which the .iss
-    covers with its "Install GIMP plugin" Start menu shortcut. So the worst case
-    here is a warning plus a plugin waiting in a directory GIMP will read later.
+    Warns rather than aborts: installing DepthForge *before* GIMP is a supported
+    flow, which the .iss covers with its "Install GIMP plugin" Start menu
+    shortcut. The return value only decides whether the caller tells the user to
+    use it.
     """
     want = ".".join(str(x) for x in MIN_GIMP)
+    found_it = bool(installed or location or existed)
 
-    if found is None:
-        if not existed:
-            warn(f"no existing GIMP config found - assuming GIMP {want}.")
-            warn("That is normal if GIMP is installed but has never been started,")
-            warn("or if you are installing DepthForge first. If GIMP is already")
-            warn("running a different version, re-run with")
-            warn("  --gimp-dir <path to your GIMP config dir>")
-        return
-
-    shown = ".".join(str(x) for x in found)
-    if found < MIN_GIMP:
-        warn(f"found GIMP {shown}, but this plugin needs {want} or newer.")
-        warn("Installing anyway, but GIMP will most likely not show it under")
-        warn("Filters. Install GIMP 3.2+ and run this installer again.")
+    if installed:
+        ok(f"GIMP {'.'.join(str(x) for x in installed)} installed"
+           + (f": {location}" if location else ""))
+        if installed[:2] < MIN_GIMP:
+            warn(f"this plugin needs GIMP {want} or newer - installing anyway,")
+            warn("but GIMP will most likely not show it under Filters.")
+    elif location:
+        ok(f"GIMP found: {location} (version unreadable)")
+    elif existed:
+        shown = ".".join(str(x) for x in series) if series else "?"
+        ok(f"no GIMP installation detected, but a GIMP {shown} config exists")
     else:
-        ok(f"GIMP {shown} detected")
+        warn("no GIMP found on this computer.")
+        warn("Installing the files anyway and assuming GIMP 3.2 - that is the")
+        warn("right thing to do if you are installing DepthForge first.")
+
+    if not existed and found_it:
+        info("GIMP has never been started, so its config directory is being")
+        info("created now. That is normal on a fresh installation.")
+    return found_it
 
 
 # ── Install steps ────────────────────────────────────────────────────────────
@@ -216,6 +356,66 @@ def write_install_json(dest_plugin_dir: Path, app_root: Path) -> None:
     info(f"python       = {data['venv_python']}")
 
 
+def clear_stale_env_override(expected: Path) -> None:
+    """Drop a DEPTHFORGE_PYTHON left behind by an older source install.
+
+    That variable is machine-wide, so it outlives the install that wrote it: a
+    developer install from months ago kept pointing GIMP at a venv that no
+    longer worked, and this bundle - correct in every other respect - was
+    silently outranked. The plugin now prefers depthforge_install.json, but the
+    variable still misleads the CLI, the diagnostics and the next reader of the
+    log, so clear it whenever it disagrees with what we just installed.
+
+    Never touched when it already matches us: that is somebody's deliberate
+    setup, not a leftover.
+    """
+    if platform.system() == "Windows":
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0,
+                                winreg.KEY_READ | winreg.KEY_SET_VALUE) as key:
+                try:
+                    current, _ = winreg.QueryValueEx(key, "DEPTHFORGE_PYTHON")
+                except FileNotFoundError:
+                    return
+                if os.path.normcase(os.path.expandvars(str(current))) == \
+                        os.path.normcase(str(expected)):
+                    ok("DEPTHFORGE_PYTHON already points here - left alone")
+                    return
+                winreg.DeleteValue(key, "DEPTHFORGE_PYTHON")
+            info(f"removed stale DEPTHFORGE_PYTHON = {current}")
+            info("(it pointed at a different interpreter, from an older install)")
+            # Without the broadcast, Explorer - and therefore GIMP - keeps the
+            # old environment block until the user logs out.
+            import ctypes
+            ctypes.windll.user32.SendMessageTimeoutW(
+                0xFFFF, 0x001A, 0, "Environment", 2, 5000, None
+            )
+        except Exception as e:
+            warn(f"could not check DEPTHFORGE_PYTHON in the registry: {e}")
+        return
+
+    # POSIX: the old install.py appended `export DEPTHFORGE_PYTHON=...` to the
+    # shell rc files. Those lines are ours and nothing else writes them.
+    for rc in (Path.home() / ".profile", Path.home() / ".bashrc"):
+        try:
+            if not rc.is_file():
+                continue
+            lines = rc.read_text(encoding="utf-8").splitlines(keepends=True)
+            kept = [ln for ln in lines
+                    if not ln.lstrip().startswith("export DEPTHFORGE_PYTHON=")]
+            if len(kept) != len(lines):
+                rc.write_text("".join(kept), encoding="utf-8")
+                info(f"removed stale DEPTHFORGE_PYTHON export from {rc}")
+        except Exception as e:
+            warn(f"could not clean {rc}: {e}")
+
+    current = os.environ.get("DEPTHFORGE_PYTHON", "")
+    if current and os.path.realpath(current) != os.path.realpath(str(expected)):
+        warn(f"DEPTHFORGE_PYTHON={current} is still set in this shell.")
+        warn("Start GIMP from a new shell, or log out, so it does not inherit it.")
+
+
 def models_present(app_root: Path) -> bool:
     required = [
         app_root / "models" / "dpt" / "openvino" / "dpt_large.bin",
@@ -237,7 +437,7 @@ def download_models(app_root: Path, release: str) -> bool:
     info("downloading OpenVINO models (~686 MB, one time)")
     r = subprocess.run(
         [str(bundled_python()), str(script), "--release", release],
-        cwd=str(app_root),
+        cwd=str(app_root), env=child_env(),
     )
     return r.returncode == 0
 
@@ -258,6 +458,7 @@ def verify(app_root: Path) -> bool:
     r = subprocess.run(
         [str(bundled_python()), "-c", code],
         capture_output=True, text=True, errors="replace", cwd=str(app_root),
+        env=child_env(),
     )
     if r.returncode != 0:
         fail("verification failed:")
@@ -299,7 +500,8 @@ def main() -> None:
     print(f"  bundled Python {manifest.get('python_version', '?')}")
     print("=" * 64)
 
-    plugin_dir, existed, gimp_version = find_gimp_plugin_dir(args.gimp_dir)
+    installed_ver, installed_loc = detect_installed_gimp()
+    plugin_dir, existed, series = find_gimp_plugin_dir(args.gimp_dir, installed_ver)
 
     if args.uninstall:
         section("Uninstalling")
@@ -307,12 +509,13 @@ def main() -> None:
         return
 
     section("GIMP")
+    gimp_found = report_gimp(installed_ver, installed_loc, existed, series)
     info(f"plug-ins directory: {plugin_dir}")
-    check_gimp_version(existed, gimp_version)
 
     section("Plugin")
     dest = install_plugin(plugin_dir)
     write_install_json(dest, app_root)
+    clear_stale_env_override(bundled_python())
 
     section("Models")
     if models_present(app_root):
@@ -341,6 +544,18 @@ def main() -> None:
     print(f"    {BUNDLE_ROOT}")
     print("  GIMP now points at the Python interpreter inside it.")
     print("  To move it, move the folder and re-run the installer from there.")
+
+    # Everything shipped and verified, but there is no GIMP to receive it. Exit
+    # non-zero so the .exe surfaces its "install the plugin later" dialog instead
+    # of reporting a clean success the user cannot act on.
+    if not gimp_found and not args.gimp_dir:
+        section("GIMP not found")
+        print("  DepthForge itself is installed and working, but no GIMP was")
+        print("  found on this computer, so the plugin has nowhere to appear.")
+        print()
+        print("  Install GIMP 3.2 or newer, then run this installer again -")
+        print('  on Windows via the Start menu shortcut "Install GIMP plugin".')
+        sys.exit(2)
 
 
 if __name__ == "__main__":

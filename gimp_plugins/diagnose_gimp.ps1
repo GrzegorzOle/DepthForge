@@ -1,11 +1,34 @@
-# DepthForge – Narzędzie diagnostyczne GIMP
+﻿# DepthForge – Narzędzie diagnostyczne GIMP
 # Uruchom w PowerShell: .\gimp_plugins\diagnose_gimp.ps1
 
-$PLUGIN_DIR  = "$env:APPDATA\GIMP\3.0\plug-ins\depthforge"
+# Nic tu nie moze byc zaszyte na sztywno: skrypt ma dzialac na maszynie
+# uzytkownika, a nie tylko na tej, na ktorej powstal. Katalog konfiguracyjny
+# GIMP-a wybieramy najnowszy z istniejacych (3.0, 3.2, ...), bo stara instalacja
+# potrafi zostac na dysku i myli diagnostyke.
+$GIMP_BASE = "$env:APPDATA\GIMP"
+$GIMP_VER  = if (Test-Path $GIMP_BASE) {
+    Get-ChildItem $GIMP_BASE -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^\d+\.\d+$' } |
+        Sort-Object { [version]$_.Name } -Descending |
+        Select-Object -First 1 -ExpandProperty Name
+} else { $null }
+if (-not $GIMP_VER) { $GIMP_VER = "3.2" }
+
+$GIMP_CACHE  = "$GIMP_BASE\$GIMP_VER"
+$PLUGIN_DIR  = "$GIMP_CACHE\plug-ins\depthforge"
 $LOG_PLUGIN  = "$PLUGIN_DIR\depthforge_run.log"
 $LOG_TEMP    = "$env:TEMP\depthforge_run.log"
-$GIMP_EXE    = "C:\Users\grzeg\AppData\Local\Programs\GIMP 3\bin\gimp.exe"
-$GIMP_CACHE  = "$env:APPDATA\GIMP\3.0"
+
+$GIMP_EXE = @(
+    "$env:LOCALAPPDATA\Programs\GIMP 3\bin\gimp.exe",
+    "$env:ProgramFiles\GIMP 3\bin\gimp.exe",
+    "${env:ProgramFiles(x86)}\GIMP 3\bin\gimp.exe"
+) | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $GIMP_EXE) {
+    $cmd = Get-Command gimp.exe, gimp-3.exe -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($cmd) { $GIMP_EXE = $cmd.Source }
+}
 
 Write-Host ""
 Write-Host "==========================================" -ForegroundColor Cyan
@@ -21,7 +44,7 @@ if (Test-Path $PLUGIN_DIR) {
     }
 } else {
     Write-Host "      BRAK folderu: $PLUGIN_DIR" -ForegroundColor Red
-    Write-Host "      Uruchom: python H:\test\DepthForge\install.py --gimp-only --yes"
+    Write-Host "      Uruchom ponownie instalator DepthForge (setup.exe lub install.py)"
     exit 1
 }
 
@@ -43,15 +66,27 @@ if (Test-Path $json_path) {
 }
 
 # 3. Sprawdz env var
+# Kolejnosc musi byc taka sama jak w _find_external_python(): najpierw install
+# JSON, potem zmienna srodowiskowa. Inaczej ten raport pokazuje inny interpreter
+# niz ten, ktorego naprawde uzywa wtyczka - a to wlasnie taka rozbieznosc
+# kosztowala cala sesje debugowania.
 Write-Host ""
 Write-Host "[ 3 ] Zmienna DEPTHFORGE_PYTHON:" -ForegroundColor Yellow
 $env_val = [System.Environment]::GetEnvironmentVariable("DEPTHFORGE_PYTHON", "User")
+$json_py = if ($cfg -and $cfg.venv_python -and (Test-Path $cfg.venv_python)) { $cfg.venv_python } else { $null }
 if ($env_val) {
-    Write-Host "      $env_val" -ForegroundColor Green
-    if (Test-Path $env_val) {
-        Write-Host "      Plik istnieje: OK" -ForegroundColor Green
-    } else {
+    Write-Host "      $env_val"
+    if (-not (Test-Path $env_val)) {
         Write-Host "      UWAGA: plik nie istnieje!" -ForegroundColor Red
+    }
+    if ($json_py) {
+        if ((Resolve-Path $json_py).Path -ieq (Resolve-Path $env_val -ErrorAction SilentlyContinue).Path) {
+            Write-Host "      Zgodna z install JSON: OK" -ForegroundColor Green
+        } else {
+            Write-Host "      IGNOROWANA - install JSON ma pierwszenstwo." -ForegroundColor Yellow
+            Write-Host "      Prawdopodobnie pozostalosc po starszej instalacji." -ForegroundColor Yellow
+            Write-Host "      Usun ja: [Environment]::SetEnvironmentVariable('DEPTHFORGE_PYTHON',`$null,'User')" -ForegroundColor Yellow
+        }
     }
 } else {
     Write-Host "      (nie ustawiona – wtyczka uzyje depthforge_install.json)" -ForegroundColor Yellow
@@ -60,7 +95,7 @@ if ($env_val) {
 # 4. Test zewnetrznego Pythona
 Write-Host ""
 Write-Host "[ 4 ] Test zewnetrznego Pythona (numpy + opencv):" -ForegroundColor Yellow
-$py = if ($env_val -and (Test-Path $env_val)) { $env_val } elseif ($cfg -and (Test-Path $cfg.venv_python)) { $cfg.venv_python } else { $null }
+$py = if ($json_py) { $json_py } elseif ($env_val -and (Test-Path $env_val)) { $env_val } else { $null }
 if ($py) {
     $result = & $py -c "import numpy, cv2; print(f'numpy {numpy.__version__}, opencv {cv2.__version__}')" 2>&1
     if ($LASTEXITCODE -eq 0) {
@@ -119,7 +154,7 @@ Write-Host "  4. Zamknij GIMP" -ForegroundColor White
 Write-Host ""
 
 # Uruchom GIMP i czekaj na zamkniecie
-if (Test-Path $GIMP_EXE) {
+if ($GIMP_EXE -and (Test-Path $GIMP_EXE)) {
     Start-Process $GIMP_EXE -Wait
 } else {
     # Sprobuj znalezc GIMP w innych lokalizacjach
@@ -158,15 +193,22 @@ if (-not $found_log) {
     Write-Host ""
 
     # Przetestuj plik Python
-    $py_sys = Get-Command python -ErrorAction SilentlyContinue
-    if ($py_sys) {
-        $syntax = & python -c "import ast; ast.parse(open(r'$PLUGIN_DIR\depthforge.py', encoding='utf-8').read()); print('Syntax OK')" 2>&1
+    # Uzyj interpretera z instalacji; systemowego Pythona na maszynie klienta
+    # zwyczajnie nie ma i nie musi byc.
+    $py_chk = if ($py) { $py } else {
+        $c = Get-Command python -ErrorAction SilentlyContinue
+        if ($c) { $c.Source } else { $null }
+    }
+    if ($py_chk) {
+        $syntax = & $py_chk -c "import ast; ast.parse(open(r'$PLUGIN_DIR\depthforge.py', encoding='utf-8').read()); print('Syntax OK')" 2>&1
         Write-Host "  Sprawdzenie skladni: $syntax" -ForegroundColor $(if ($syntax -like "*OK*") {"Green"} else {"Red"})
     }
 
-    Write-Host ""
-    Write-Host "  b) Uruchom GIMP z konsoli zeby zobaczyc bledy:" -ForegroundColor Yellow
-    Write-Host "     & '$GIMP_EXE' 2>&1 | Tee-Object gimp_errors.txt" -ForegroundColor Cyan
+    if ($GIMP_EXE) {
+        Write-Host ""
+        Write-Host "  b) Uruchom GIMP z konsoli zeby zobaczyc bledy:" -ForegroundColor Yellow
+        Write-Host "     & '$GIMP_EXE' 2>&1 | Tee-Object gimp_errors.txt" -ForegroundColor Cyan
+    }
 }
 
 Write-Host ""
