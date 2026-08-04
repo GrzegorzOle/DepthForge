@@ -48,15 +48,31 @@ jobs:
 
       # The artifact names come from build_bundle.VERSION, not from the tag, so a
       # mismatch would silently upload 1.7.1 files to a v1.8.0 release.
-      - name: Check the tag matches packaging/build_bundle.py VERSION
+      #
+      # config.json is checked too because the plugin's updater compares the
+      # release tag against the *installed* version, and config.json is where a
+      # source checkout keeps it. If the two drift, every installation is told
+      # forever that an update is available - or, worse, never told at all.
+      - name: Check the tag matches build_bundle.VERSION and config.json
         run: |
           version=$(python -c "import sys; sys.path.insert(0, 'packaging'); import build_bundle; print(build_bundle.VERSION)")
-          echo "build_bundle.VERSION = $version, tag = ${{ steps.tag.outputs.name }}"
+          cfg=$(python -c "import json; print(json.load(open('config.json'))['project']['version'])")
+          echo "build_bundle.VERSION = $version, config.json = $cfg, tag = ${{ steps.tag.outputs.name }}"
           test "v$version" = "${{ steps.tag.outputs.name }}" || {
             echo "::error::tag ${{ steps.tag.outputs.name }} does not match VERSION $version"
             exit 1
           }
+          test "$cfg" = "$version" || {
+            echo "::error::config.json version $cfg does not match VERSION $version"
+            exit 1
+          }
           echo "version=$version" >> "$GITHUB_ENV"
+
+      # ~50 KB, seconds to build, and the artifact the GIMP plugin installs by
+      # itself. Built first so a mistake here fails in seconds rather than after
+      # the 25 minutes the bundles take.
+      - name: Build the code update package
+        run: python packaging/build_code_update.py
 
       - name: Disk space before
         run: df -h /
@@ -119,3 +135,22 @@ jobs:
             dist/DepthForge-${version}-*.tar.gz \
             dist/DepthForge-${version}-*.sha256 \
             --clobber
+
+      # The plugin looks up DepthForge-<version>-code.zip by exact name and
+      # refuses to install it without the matching .sha256. Both are covered by
+      # the globs above; this only proves they actually made it to the release,
+      # because the failure mode is silent - installed copies simply never see
+      # the update and the release looks fine.
+      - name: Verify the update package reached the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          names=$(gh release view "${{ steps.tag.outputs.name }}" \
+                    --json assets --jq '.assets[].name')
+          for want in "DepthForge-${version}-code.zip" "DepthForge-${version}-code.zip.sha256"; do
+            echo "$names" | grep -qx "$want" || {
+              echo "::error::$want is missing from the release - in-place plugin updates will not work"
+              exit 1
+            }
+            echo "ok: $want"
+          done

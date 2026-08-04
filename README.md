@@ -70,8 +70,8 @@ the [Releases page](https://github.com/GrzegorzOle/DepthForge/releases/latest):
 
 | Platform | Download | Install | Models |
 |---|---|---|---|
-| Windows 10/11 64-bit | `DepthForge-1.7.1-windows-x86_64-setup.exe` | run it | included |
-| Linux x86_64 (glibc 2.28+) | `DepthForge-1.7.1-x86_64.AppImage` | `chmod +x` then run it | included |
+| Windows 10/11 64-bit | `DepthForge-1.8.0-windows-x86_64-setup.exe` | run it | included |
+| Linux x86_64 (glibc 2.28+) | `DepthForge-1.8.0-x86_64.AppImage` | `chmod +x` then run it | included |
 | Either, without the models | `…-linux-x86_64.tar.gz` / `…-windows-x86_64.zip` | `./install.sh` / `install.bat` | downloaded on install |
 
 The first two are **offline** packages: they carry the OpenVINO models (~686 MB)
@@ -94,6 +94,46 @@ Two things worth knowing:
 
 Full end-user instructions ship inside every package as `INSTALL_EN.md` /
 `INSTALL_PL.md`, and live in the repository under `packaging/bundle_files/`.
+
+### Updates
+
+**Filters → DepthForge → Sprawdź aktualizacje…** asks GitHub for the newest
+release and, where possible, installs it without leaving GIMP. The plugin also
+checks quietly in the background — at most once a day, in a thread, after a run
+you were waiting on anyway — and mentions a new version once.
+
+What gets installed in place is the **code update package**
+(`DepthForge-<version>-code.zip`, ~50 KB): `src/`, `download_models.py` and the
+plugin itself. The private CPython runtime, OpenVINO and the model weights that
+make up the rest of the ~1.2 GB offline package are left alone, because they
+change far more rarely than the pipeline does and re-downloading them for a
+tactile-smoothing fix would be absurd on a metered museum connection.
+
+The safety rails, none of them optional:
+
+- The package's SHA-256 is verified against the release's `.sha256` asset before
+  anything is touched. Missing checksum → the update is refused. It replaces
+  `src/` wholesale, so an unverified download would be remote code execution
+  regardless of HTTPS.
+- `src/` and the plugin are backed up, and after the swap the new code must
+  import against the *installed* numpy/OpenCV/OpenVINO. If it does not, the
+  backup is restored byte-for-byte and nothing has changed.
+- Each package declares the oldest runtime it can run on. When a release needs a
+  dependency the installed runtime lacks, the in-place update refuses and points
+  at the full installer instead.
+- **`config.json` is never overwritten** — it is the one file you may have
+  edited. `VERSION.json` carries the version instead. (Consequence for
+  contributors: a new `config.json` key must be optional, with its default in
+  code, because updated installations keep their old `config.json`.)
+
+Two installation types cannot update in place, and say so instead of failing:
+the **AppImage** (its `src/` is a symlink into the read-only squashfs mount —
+download the new `.AppImage`) and a **git checkout** (use `git pull`).
+
+Set `"check_updates": false` in `depthforge_install.json`, next to the installed
+plugin, to switch the whole thing off; `"update_repo": "owner/name"` points it at
+a fork or an internal mirror. Offline machines are a supported setup: a failed
+check is a log line, never a dialog.
 
 ### For developers — from source
 
@@ -147,8 +187,15 @@ first with `--with-models --no-archive`:
 ```bash
 python packaging/build_appimage.py               # → dist/DepthForge-x.y.z-x86_64.AppImage
 python packaging/build_installer.py              # → dist/…-windows-x86_64-setup.exe
+python packaging/build_code_update.py            # → dist/DepthForge-x.y.z-code.zip (+ .sha256)
 python packaging/assets/make_icon.py             # regenerate the icon (committed)
 ```
+
+`build_code_update.py` is the odd one out: it needs no runtime and takes
+seconds, but the release is incomplete without it — installed copies find
+updates by that exact filename. Bump its `MIN_RUNTIME_VERSION` whenever
+`requirements.txt` gains or bumps a dependency, or a code update will land on a
+runtime that cannot run it.
 
 `build_installer.py` runs Inno Setup under wine in the `amake/innosetup`
 container, so it needs podman or docker — but not wine on the host.

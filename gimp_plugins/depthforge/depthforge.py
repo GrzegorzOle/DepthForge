@@ -29,6 +29,7 @@ import sys
 import os
 import struct
 import zlib
+import time
 import tempfile
 import subprocess
 import traceback
@@ -42,9 +43,18 @@ gi.require_version("Gegl",   "0.4")
 
 from gi.repository import Gimp, GimpUi, GLib, GObject, Gio, Gegl
 
-PROC_NAME  = "plug-in-depthforge"
-PROC_DIAG  = "plug-in-depthforge-diagnose"
-MENU_PATH  = "<Image>/Filters/DepthForge"
+PROC_NAME   = "plug-in-depthforge"
+PROC_DIAG   = "plug-in-depthforge-diagnose"
+PROC_UPDATE = "plug-in-depthforge-update"
+MENU_PATH   = "<Image>/Filters/DepthForge"
+
+# Where releases are published. Overridable per installation through the
+# "update_repo" key in depthforge_install.json, so a fork or an internal mirror
+# does not need a code change — and "check_updates": false in the same file
+# turns the whole thing off for an air-gapped museum machine.
+UPDATE_REPO_DEFAULT = "GrzegorzOle/DepthForge"
+UPDATE_API_URL = "https://api.github.com/repos/{repo}/releases/latest"
+UPDATE_CHECK_INTERVAL_S = 24 * 3600
 
 # Resolve plugin directory robustly:
 # In GIMP 3.x, __file__ may be a bare filename with no directory.
@@ -220,6 +230,364 @@ def _child_env() -> dict:
     # can shadow a stdlib module. Python 3.11+; older versions ignore it.
     env["PYTHONSAFEPATH"] = "1"
     return env
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Update check
+#
+#  Everything here is best-effort by design. The target audience is museums,
+#  the product is deliberately offline-capable and ships its models inside the
+#  installer, so a machine with no route to github.com is a supported setup —
+#  not an error state. No failure in this section may ever reach the user as
+#  anything but a log line.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _install_config() -> dict:
+    """Contents of depthforge_install.json, or {} when absent/unreadable."""
+    try:
+        with open(os.path.join(_PLUGIN_DIR, "depthforge_install.json"),
+                  encoding="utf-8") as f:
+            data = _json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _update_repo() -> str:
+    return str(_install_config().get("update_repo", "")).strip() or UPDATE_REPO_DEFAULT
+
+
+def _updates_enabled() -> bool:
+    return _install_config().get("check_updates", True) is not False
+
+
+def _installed_version() -> str:
+    """Version of the DepthForge code this plugin drives.
+
+    VERSION.json is written by the bundle builder and rewritten by the updater,
+    so it is the value that actually advances after an in-place code update.
+    config.json is the fallback for source checkouts, which have no VERSION.json
+    — and the updater deliberately never touches config.json, because it is the
+    one file a user may reasonably have edited.
+    """
+    root = _find_project_root()
+    if not root:
+        return ""
+    try:
+        with open(os.path.join(root, "VERSION.json"), encoding="utf-8") as f:
+            v = str(_json.load(f).get("version", "")).strip()
+        if v:
+            return v
+    except Exception:
+        pass
+    try:
+        with open(os.path.join(root, "config.json"), encoding="utf-8") as f:
+            return str(_json.load(f).get("project", {}).get("version", "")).strip()
+    except Exception:
+        return ""
+
+
+def _parse_version(text: str) -> tuple:
+    """'v1.7.10-rc1' → (1, 7, 10). Unparsable components count as 0."""
+    parts = []
+    for chunk in str(text or "").strip().lstrip("vV").split(".")[:4]:
+        digits = ""
+        for ch in chunk:
+            if not ch.isdigit():
+                break
+            digits += ch
+        parts.append(int(digits) if digits else 0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts)
+
+
+def _is_newer(latest: str, installed: str) -> bool:
+    if not latest or not installed:
+        return False
+    return _parse_version(latest) > _parse_version(installed)
+
+
+def _update_cache_path() -> str:
+    if os.path.isdir(_PLUGIN_DIR) and os.access(_PLUGIN_DIR, os.W_OK):
+        return os.path.join(_PLUGIN_DIR, "depthforge_update.json")
+    return os.path.join(tempfile.gettempdir(), "depthforge_update.json")
+
+
+def _read_update_cache() -> dict:
+    try:
+        with open(_update_cache_path(), encoding="utf-8") as f:
+            data = _json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_update_cache(data: dict) -> None:
+    """Write the cache atomically — the writer is a daemon thread that GIMP may
+    kill at any moment when the plug-in process exits, and a half-written cache
+    would suppress every later check."""
+    path = _update_cache_path()
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            _json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+    except Exception as e:
+        _log(f"could not write update cache: {e}")
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+
+
+def _fetch_latest_release(timeout: float = 8.0):
+    """Newest published (non-draft, non-prerelease) release, or None."""
+    import urllib.request
+
+    url = UPDATE_API_URL.format(repo=_update_repo())
+    req = urllib.request.Request(url, headers={
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "DepthForge-plugin",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = _json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception as e:
+        _log(f"update check failed ({url}): {e}")
+        return None
+
+    tag = str(data.get("tag_name", "")).strip()
+    if not tag:
+        _log("update check: release has no tag_name")
+        return None
+
+    version = tag.lstrip("vV")
+    assets = {}
+    for a in (data.get("assets") or []):
+        name = str(a.get("name", ""))
+        if name:
+            assets[name] = str(a.get("browser_download_url", ""))
+    code_zip = f"DepthForge-{version}-code.zip"
+
+    info = {
+        "checked_at":   int(time.time()),
+        "tag":          tag,
+        "version":      version,
+        "html_url":     str(data.get("html_url", "")),
+        "notes":        (str(data.get("body") or "")).strip()[:600],
+        "code_url":     assets.get(code_zip, ""),
+        "code_sha_url": assets.get(code_zip + ".sha256", ""),
+    }
+    _log(f"update check: latest={version} code_pkg={'yes' if info['code_url'] else 'no'}")
+    return info
+
+
+def _start_background_update_check() -> None:
+    """Refresh the cached release info without blocking anything.
+
+    Deliberately *not* called from do_query_procedures(): that runs at GIMP
+    startup for every installed plug-in, and a network round trip there would
+    stall the splash screen on a machine with no route to github.com. The thread
+    only writes the cache file; every dialog reads the cache, never the network.
+    """
+    if not _updates_enabled():
+        return
+    cache = _read_update_cache()
+    try:
+        age = time.time() - float(cache.get("checked_at", 0))
+    except Exception:
+        age = UPDATE_CHECK_INTERVAL_S + 1
+    if age < UPDATE_CHECK_INTERVAL_S:
+        return
+
+    def _worker():
+        info = _fetch_latest_release()
+        if info is None:
+            # Stamp the attempt anyway: without this an offline machine retries
+            # on every single run and pays the timeout each time.
+            stale = _read_update_cache()
+            stale["checked_at"] = int(time.time())
+            _write_update_cache(stale)
+            return
+        old = _read_update_cache()
+        info["notified"] = (old.get("version") == info["version"]
+                            and bool(old.get("notified")))
+        _write_update_cache(info)
+
+    try:
+        import threading
+        threading.Thread(target=_worker, daemon=True).start()
+    except Exception as e:
+        _log(f"could not start the update check thread: {e}")
+
+
+def _code_update_possible() -> tuple:
+    """(can_update, reason) for an in-place code update of this installation.
+
+    No for an AppImage: project_root/src is a symlink into the squashfs mount,
+    which is read-only by construction and lands at a fresh /tmp/.mount_XXXXXX
+    on every launch. Those users get the new .AppImage instead — replacing the
+    file is their update mechanism.
+    """
+    root = _find_project_root()
+    if not root:
+        return False, "nie znaleziono katalogu projektu DepthForge"
+    src = os.path.join(root, "src")
+    if os.path.islink(src):
+        return False, "instalacja AppImage – pobierz nowy plik .AppImage"
+    # A developer checkout is not an installation to overwrite: the update
+    # replaces src/ wholesale, which would silently blow away uncommitted work.
+    if os.path.isdir(os.path.join(root, ".git")):
+        return False, "instalacja ze źródeł (repozytorium git) – użyj git pull"
+    if not os.access(root, os.W_OK):
+        return False, "katalog projektu jest tylko do odczytu"
+    if os.path.isdir(src) and not os.access(src, os.W_OK):
+        return False, "katalog src/ jest tylko do odczytu"
+    if not os.access(_PLUGIN_DIR, os.W_OK):
+        return False, "katalog wtyczki jest tylko do odczytu"
+    if not _find_external_python():
+        return False, "nie znaleziono interpretera DepthForge"
+    return True, ""
+
+
+def _open_url(url: str) -> None:
+    if not url:
+        return
+    try:
+        Gio.AppInfo.launch_default_for_uri(url, None)
+    except Exception as e:
+        _log(f"could not open {url}: {e}")
+
+
+def _message_dialog(title: str, body: str, buttons=None) -> int:
+    """Plain GTK message box. buttons = [(label, response), …]; default OK."""
+    try:
+        from gi.repository import Gtk
+        dlg = Gtk.MessageDialog(
+            message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.NONE,
+            text=title,
+        )
+        dlg.format_secondary_text(body)
+        for label, response in (buttons or [("OK", 0)]):
+            dlg.add_button(label, response)
+        dlg.set_default_response(0)
+        result = dlg.run()
+        dlg.destroy()
+        return result
+    except Exception as e:
+        _log(f"dialog failed ({title}): {e}")
+        return 0
+
+
+def _apply_code_update(info: dict) -> tuple:
+    """Run the update helper in the DepthForge interpreter. → (ok, detail)."""
+    import shutil as _sh
+
+    ext_python = _find_external_python()
+    root = _find_project_root() or ""
+    if not ext_python or not root:
+        return False, "brak interpretera lub katalogu projektu"
+
+    # Same private-directory rule as the pipeline helper: a script sitting
+    # directly in %TEMP% would put that world-writable folder on sys.path.
+    work = tempfile.mkdtemp(prefix="df_update_")
+    script = os.path.join(work, "df_update.py")
+    try:
+        with open(script, "w", encoding="utf-8") as fh:
+            fh.write(_UPDATE_SCRIPT)
+        cmd = [ext_python, script,
+               info.get("code_url", ""), info.get("code_sha_url", ""),
+               root, _PLUGIN_DIR, info.get("version", "")]
+        _log(f"update: running {ext_python} on {info.get('code_url','')}")
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace",
+                           env=_child_env(), timeout=900)
+    except Exception as e:
+        _log(f"update helper failed to run: {e}")
+        return False, str(e)
+    finally:
+        _sh.rmtree(work, ignore_errors=True)
+
+    # Full output to the log, tail to the user: as everywhere else here, the
+    # real cause is printed last.
+    _log(f"update helper exit={r.returncode}")
+    if r.stdout.strip():
+        _log("--- update stdout ---\n" + r.stdout.strip())
+    if r.stderr.strip():
+        _log("--- update stderr ---\n" + r.stderr.strip())
+
+    if r.returncode == 0 and "UPDATE_OK:" in r.stdout:
+        return True, r.stdout.strip()[-400:]
+    return False, (r.stdout + "\n" + r.stderr).strip()[-700:]
+
+
+def _offer_update(info: dict, installed: str) -> None:
+    """Show what is available and act on the answer."""
+    can_apply, reason = _code_update_possible()
+    has_pkg = bool(info.get("code_url"))
+
+    body = (f"Zainstalowana wersja: {installed or '?'}\n"
+            f"Dostępna wersja: {info.get('version', '?')}\n")
+    if not has_pkg:
+        body += "\nTo wydanie nie zawiera pakietu aktualizacji kodu –\n" \
+                "trzeba pobrać pełny instalator.\n"
+    elif not can_apply:
+        body += f"\nAktualizacja w miejscu niemożliwa: {reason}.\n"
+    if info.get("notes"):
+        body += "\n" + info["notes"]
+
+    buttons = []
+    if has_pkg and can_apply:
+        buttons.append(("Aktualizuj teraz", 1))
+    if info.get("html_url"):
+        buttons.append(("Otwórz stronę wydania", 2))
+    buttons.append(("Później", 0))
+
+    answer = _message_dialog("DepthForge – dostępna aktualizacja", body, buttons)
+    if answer == 2:
+        _open_url(info.get("html_url", ""))
+        return
+    if answer != 1:
+        return
+
+    ok, detail = _apply_code_update(info)
+    if ok:
+        # Drop the cache so the next check re-reads the now-current version
+        # instead of offering the update the user just installed.
+        _write_update_cache({})
+        _message_dialog(
+            "DepthForge – zaktualizowano",
+            f"Zainstalowano wersję {info.get('version', '?')}.\n\n"
+            "Uruchom ponownie GIMP-a, żeby załadować nową wtyczkę.\n\n"
+            f"Log: {_LOG_FILE}",
+        )
+    else:
+        answer = _message_dialog(
+            "DepthForge – aktualizacja nieudana",
+            "Nic nie zostało zmienione – poprzednia wersja została przywrócona.\n\n"
+            f"{detail}\n\nPełny log: {_LOG_FILE}",
+            [("Otwórz stronę wydania", 2), ("OK", 0)],
+        )
+        if answer == 2:
+            _open_url(info.get("html_url", ""))
+
+
+def _maybe_notify_update() -> None:
+    """One quiet nudge per new version, after a run the user already waited on."""
+    try:
+        if not _updates_enabled():
+            return
+        cache = _read_update_cache()
+        latest = str(cache.get("version", ""))
+        if cache.get("notified") or not _is_newer(latest, _installed_version()):
+            return
+        cache["notified"] = True
+        _write_update_cache(cache)
+        _offer_update(cache, _installed_version())
+    except Exception as e:
+        _log(f"update notification failed: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -493,6 +861,218 @@ if stl_out_path:
 """
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Update helper script  (runs in the DepthForge interpreter, stdlib only)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_UPDATE_SCRIPT = r"""
+# DepthForge – applies a code-only update package.
+#
+# Runs in the DepthForge interpreter (bundled runtime or project .venv), never
+# in GIMP's Python, for two reasons: a multi-megabyte download must not block
+# GIMP's UI thread, and only this interpreter can prove, after the swap, that
+# the new code still imports against the installed numpy/opencv/openvino. That
+# check is what makes the rollback below worth anything.
+#
+# Everything here is stdlib: the package may well contain the fix for whatever
+# is broken in src/, so this script must not import from it.
+import sys, os, json, hashlib, shutil, zipfile, tempfile, subprocess
+import urllib.request
+
+asset_url    = sys.argv[1] if len(sys.argv) > 1 else ""
+sha_url      = sys.argv[2] if len(sys.argv) > 2 else ""
+project_root = sys.argv[3] if len(sys.argv) > 3 else ""
+plugin_dir   = sys.argv[4] if len(sys.argv) > 4 else ""
+new_version  = sys.argv[5] if len(sys.argv) > 5 else ""
+
+HEADERS = {"User-Agent": "DepthForge-updater"}
+
+
+def fail(msg):
+    print("UPDATE_FAIL: " + msg, flush=True)
+    sys.exit(1)
+
+
+def fetch(url, timeout=600):
+    req = urllib.request.Request(url, headers=HEADERS)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def parse_version(text):
+    parts = []
+    for chunk in str(text or "").strip().lstrip("vV").split(".")[:4]:
+        digits = ""
+        for ch in chunk:
+            if not ch.isdigit():
+                break
+            digits += ch
+        parts.append(int(digits) if digits else 0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts)
+
+
+def installed_version():
+    for name, path_keys in (("VERSION.json", ("version",)),
+                            ("config.json", ("project", "version"))):
+        try:
+            with open(os.path.join(project_root, name), encoding="utf-8") as fh:
+                data = json.load(fh)
+            for key in path_keys:
+                data = data[key]
+            if str(data).strip():
+                return str(data).strip()
+        except Exception:
+            continue
+    return ""
+
+
+if not asset_url:
+    fail("this release publishes no code update package")
+if not project_root or not os.path.isdir(project_root):
+    fail("project root does not exist: " + str(project_root))
+
+work = tempfile.mkdtemp(prefix="df_update_work_")
+try:
+    print("downloading " + asset_url, flush=True)
+    blob = fetch(asset_url)
+    print("got %d bytes" % len(blob), flush=True)
+
+    # The package replaces src/ wholesale, so an unverified download is an
+    # arbitrary-code-execution hole even over HTTPS: a mirror, a caching proxy
+    # or a truncated body would every one of them pass silently otherwise.
+    if not sha_url:
+        fail("release publishes no .sha256 for the code package")
+    want = fetch(sha_url, timeout=60).decode("utf-8", "replace").split()[0].strip()
+    got = hashlib.sha256(blob).hexdigest()
+    if want.lower() != got.lower():
+        fail("sha256 mismatch: expected %s, got %s" % (want, got))
+    print("sha256 OK " + got, flush=True)
+
+    zip_path = os.path.join(work, "code.zip")
+    with open(zip_path, "wb") as fh:
+        fh.write(blob)
+
+    extract = os.path.join(work, "extract")
+    with zipfile.ZipFile(zip_path) as zf:
+        for member in zf.namelist():
+            norm = os.path.normpath(member)
+            if (member.startswith("/") or member.startswith("\\")
+                    or os.path.splitdrive(norm)[0]
+                    or ".." in norm.replace("\\", "/").split("/")):
+                fail("refusing zip member outside the tree: " + member)
+        zf.extractall(extract)
+
+    meta_path = os.path.join(extract, "code.json")
+    if not os.path.isfile(meta_path):
+        fail("package has no code.json - not a DepthForge code update")
+    with open(meta_path, encoding="utf-8") as fh:
+        meta = json.load(fh)
+    pkg_version = str(meta.get("version", "")).strip()
+    if new_version and pkg_version != new_version:
+        fail("package is %s but the release says %s" % (pkg_version, new_version))
+
+    # The valve that keeps a code-only update honest: the runtime (CPython plus
+    # numpy/opencv/openvino) is not shipped here, so a release that needs a new
+    # or newer dependency must refuse and send the user to the full installer.
+    needs = str(meta.get("requires_runtime", "")).strip()
+    have = installed_version()
+    if needs and have and parse_version(have) < parse_version(needs):
+        fail("this update needs runtime %s but %s is installed - "
+             "run the full DepthForge installer instead" % (needs, have))
+
+    new_app = os.path.join(extract, "app")
+    if not os.path.isdir(new_app):
+        fail("package has no app/ payload")
+
+    backup = os.path.join(work, "backup")
+    os.makedirs(backup)
+    replaced = []          # (live path, backup path, kind)
+
+    def stash(live, key):
+        dst = os.path.join(backup, key)
+        if os.path.isdir(live) and not os.path.islink(live):
+            shutil.copytree(live, dst, symlinks=True)
+            replaced.append((live, dst, "dir"))
+        elif os.path.exists(live):
+            shutil.copy2(live, dst)
+            replaced.append((live, dst, "file"))
+        else:
+            # Recorded too: a rollback has to remove files this update created,
+            # or a failed run leaves a VERSION.json claiming the new number.
+            replaced.append((live, None, "absent"))
+
+    def restore():
+        for live, dst, kind in reversed(replaced):
+            try:
+                if kind == "absent":
+                    if os.path.isdir(live) and not os.path.islink(live):
+                        shutil.rmtree(live, ignore_errors=True)
+                    elif os.path.exists(live) or os.path.islink(live):
+                        os.unlink(live)
+                elif kind == "dir":
+                    shutil.rmtree(live, ignore_errors=True)
+                    shutil.copytree(dst, live, symlinks=True)
+                else:
+                    shutil.copy2(dst, live)
+            except Exception as exc:
+                print("ROLLBACK_WARN: %s: %s" % (live, exc), flush=True)
+
+    try:
+        # app/ maps onto project_root. Directories are replaced wholesale rather
+        # than merged, so a module deleted upstream really disappears instead of
+        # lingering on sys.path and shadowing whatever replaced it.
+        for entry in sorted(os.listdir(new_app)):
+            src = os.path.join(new_app, entry)
+            dst = os.path.join(project_root, entry)
+            stash(dst, "app__" + entry)
+            if os.path.isdir(src):
+                shutil.rmtree(dst, ignore_errors=True)
+                shutil.copytree(src, dst)
+            else:
+                shutil.copy2(src, dst)
+            print("updated " + dst, flush=True)
+
+        new_plugin = os.path.join(extract, "plugin", "depthforge", "depthforge.py")
+        if os.path.isfile(new_plugin) and plugin_dir:
+            live_plugin = os.path.join(plugin_dir, "depthforge.py")
+            stash(live_plugin, "plugin__depthforge.py")
+            shutil.copy2(new_plugin, live_plugin)
+            print("updated " + live_plugin, flush=True)
+
+        # Prove the new code imports against the *installed* dependencies before
+        # calling this a success. Without it a mismatched package would leave a
+        # permanently broken install behind a cheerful dialog.
+        env = dict(os.environ)
+        for var in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONEXECUTABLE"):
+            env.pop(var, None)
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONSAFEPATH"] = "1"
+        probe = ("import sys; sys.path.insert(0, sys.argv[1]); "
+                 "import depth_forge, depth_pipeline; print('import OK')")
+        r = subprocess.run(
+            [sys.executable, "-c", probe, os.path.join(project_root, "src")],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=env, cwd=project_root, timeout=300,
+        )
+        if r.returncode != 0:
+            raise RuntimeError("the new code does not import:\n"
+                               + (r.stderr or r.stdout or "")[-1200:])
+        print("smoke test: " + r.stdout.strip(), flush=True)
+    except Exception as exc:
+        restore()
+        fail("rolled back - " + str(exc))
+
+    with open(os.path.join(project_root, "VERSION.json"), "w", encoding="utf-8") as fh:
+        json.dump({"name": "DepthForge", "version": pkg_version,
+                   "source": "code-update"}, fh, indent=2)
+
+    print("UPDATE_OK:" + pkg_version, flush=True)
+finally:
+    shutil.rmtree(work, ignore_errors=True)
+"""
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  GIMP helpers
@@ -535,7 +1115,9 @@ def _load_result_image(path: str):
 class DepthForgePlugin(Gimp.PlugIn):
 
     def do_query_procedures(self):
-        return [PROC_NAME, PROC_DIAG]
+        # No network call here, however tempting: this runs at GIMP startup for
+        # every installed plug-in. See _start_background_update_check().
+        return [PROC_NAME, PROC_DIAG, PROC_UPDATE]
 
     def do_set_i18n(self, procname):
         return False, None, None
@@ -544,6 +1126,8 @@ class DepthForgePlugin(Gimp.PlugIn):
     def do_create_procedure(self, name):
         if name == PROC_DIAG:
             return self._create_diag_procedure(name)
+        if name == PROC_UPDATE:
+            return self._create_update_procedure(name)
         return self._create_main_procedure(name)
 
     def _create_main_procedure(self, name):
@@ -646,6 +1230,57 @@ class DepthForgePlugin(Gimp.PlugIn):
         procedure.set_attribution("DepthForge Team", "DepthForge Team", "2026")
         return procedure
 
+    def _create_update_procedure(self, name):
+        procedure = Gimp.Procedure.new(
+            self, name, Gimp.PDBProcType.PLUGIN, self.run_update, None
+        )
+        procedure.set_menu_label("Sprawdź aktualizacje…")
+        procedure.add_menu_path(MENU_PATH)
+        procedure.set_documentation(
+            "DepthForge – Check for updates",
+            "Checks GitHub for a newer DepthForge release and can install the "
+            "code update in place.",
+            name,
+        )
+        procedure.set_attribution("DepthForge Team", "DepthForge Team", "2026")
+        return procedure
+
+    # ── Check for updates ─────────────────────────────────────────────────────
+    def run_update(self, procedure, run_mode, args, run_data):
+        GimpUi.init("depthforge-update")
+        installed = _installed_version()
+
+        # Synchronous on purpose: the user asked, so waiting for the answer is
+        # the expected behaviour. The automatic check is the threaded one.
+        info = _fetch_latest_release(timeout=15.0)
+        if info is None:
+            _message_dialog(
+                "DepthForge – sprawdzanie aktualizacji",
+                "Nie udało się połączyć z GitHubem.\n\n"
+                f"Repozytorium: {_update_repo()}\n"
+                f"Zainstalowana wersja: {installed or '?'}\n\n"
+                f"Szczegóły w logu: {_LOG_FILE}",
+            )
+            return procedure.new_return_values(Gimp.PDBStatusType.SUCCESS, GLib.Error())
+
+        info["notified"] = True
+        _write_update_cache(info)
+
+        if _is_newer(info["version"], installed):
+            _offer_update(info, installed)
+        else:
+            answer = _message_dialog(
+                "DepthForge – wersja aktualna",
+                f"Zainstalowana wersja: {installed or '?'}\n"
+                f"Najnowsze wydanie: {info.get('version', '?')}\n\n"
+                "Nie ma nic do zaktualizowania.",
+                [("Otwórz stronę wydania", 2), ("OK", 0)],
+            )
+            if answer == 2:
+                _open_url(info.get("html_url", ""))
+
+        return procedure.new_return_values(Gimp.PDBStatusType.SUCCESS, GLib.Error())
+
     # ── Diagnose ──────────────────────────────────────────────────────────────
     def run_diag(self, procedure, run_mode, args, run_data):
         GimpUi.init("depthforge-diag")
@@ -675,6 +1310,22 @@ class DepthForgePlugin(Gimp.PlugIn):
 
         root = _find_project_root()
         lines.append(f"{'[OK]' if root else '[WARN]'} Project root: {root or 'not found'}")
+
+        installed = _installed_version()
+        lines.append(f"{'[OK]' if installed else '[WARN]'} Installed version: "
+                     f"{installed or 'unknown'}")
+        if _updates_enabled():
+            can_apply, why = _code_update_possible()
+            cache = _read_update_cache()
+            lines.append(f"[INFO] Update repo: {_update_repo()}")
+            if cache.get("version"):
+                lines.append(f"[INFO] Last seen release: {cache['version']}")
+            lines.append(
+                "[OK] In-place code update: available" if can_apply
+                else f"[INFO] In-place code update: unavailable – {why}"
+            )
+        else:
+            lines.append('[INFO] Update check: disabled ("check_updates": false)')
 
         if ext_py:
             r = subprocess.run(
@@ -762,6 +1413,11 @@ class DepthForgePlugin(Gimp.PlugIn):
              f"advanced={advanced_mode} detail_str={detail_strength} "
              f"detail_blur={detail_blur_sigma} fine_s={fine_sigma} "
              f"limb_s={limb_sigma} fill_holes={fill_holes} levels={tactile_levels}")
+
+        # Kicked off here, not at startup: the check runs in a daemon thread and
+        # has the whole pipeline subprocess to finish in, so it never costs the
+        # user a single millisecond of waiting.
+        _start_background_update_check()
 
         ext_python = _find_external_python()
         if not ext_python:
@@ -1090,6 +1746,11 @@ class DepthForgePlugin(Gimp.PlugIn):
 
         image.undo_group_end()
         Gimp.context_pop()
+
+        # After the work, never before: the user came here for a depth map, and
+        # this fires at most once per released version.
+        _maybe_notify_update()
+
         return procedure.new_return_values(Gimp.PDBStatusType.SUCCESS, GLib.Error())
 
 

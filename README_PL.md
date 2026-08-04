@@ -72,8 +72,8 @@ wcześniej. Wybierz jeden plik ze
 
 | Platforma | Plik do pobrania | Instalacja | Modele |
 |---|---|---|---|
-| Windows 10/11 64-bit | `DepthForge-1.7.1-windows-x86_64-setup.exe` | uruchom | w środku |
-| Linux x86_64 (glibc 2.28+) | `DepthForge-1.7.1-x86_64.AppImage` | `chmod +x` i uruchom | w środku |
+| Windows 10/11 64-bit | `DepthForge-1.8.0-windows-x86_64-setup.exe` | uruchom | w środku |
+| Linux x86_64 (glibc 2.28+) | `DepthForge-1.8.0-x86_64.AppImage` | `chmod +x` i uruchom | w środku |
 | Dowolna, bez modeli | `…-linux-x86_64.tar.gz` / `…-windows-x86_64.zip` | `./install.sh` / `install.bat` | pobierane przy instalacji |
 
 Dwa pierwsze to pakiety **offline** — niosą modele OpenVINO (~686 MB) w środku,
@@ -97,6 +97,47 @@ Dwie rzeczy warte wiedzenia:
 Pełna instrukcja dla użytkownika jest w środku każdego pakietu jako
 `INSTALL_PL.md` / `INSTALL_EN.md`, a w repozytorium leży w
 `packaging/bundle_files/`.
+
+### Aktualizacje
+
+**Filters → DepthForge → Sprawdź aktualizacje…** pyta GitHuba o najnowsze
+wydanie i — jeśli to możliwe — instaluje je bez wychodzenia z GIMP-a. Wtyczka
+sprawdza też po cichu w tle: najwyżej raz na dobę, w osobnym wątku, przy okazji
+przebiegu, na który i tak czekasz, i o nowej wersji wspomina jeden raz.
+
+W miejscu instaluje się **pakiet aktualizacji kodu**
+(`DepthForge-<wersja>-code.zip`, ~50 KB): `src/`, `download_models.py` i sama
+wtyczka. Prywatny CPython, OpenVINO i wagi modeli — czyli reszta z ~1,2 GB
+pakietu offline — zostają nietknięte, bo zmieniają się znacznie rzadziej niż
+pipeline, a ponowne ściąganie ich dla poprawki w wygładzaniu taktylnym byłoby
+absurdem na muzealnym łączu rozliczanym za transfer.
+
+Zabezpieczenia, żadne z nich opcjonalne:
+
+- Suma SHA-256 pakietu jest sprawdzana z assetem `.sha256` z wydania, zanim
+  cokolwiek zostanie ruszone. Brak sumy → aktualizacja odmawia. Pakiet
+  podmienia całe `src/`, więc niezweryfikowane pobranie byłoby zdalnym
+  wykonaniem kodu niezależnie od HTTPS.
+- `src/` i wtyczka trafiają do kopii zapasowej, a po podmianie nowy kod musi
+  zaimportować się przy *zainstalowanych* numpy/OpenCV/OpenVINO. Jeśli się nie
+  zaimportuje, kopia wraca bajt w bajt i nic się nie zmieniło.
+- Każdy pakiet deklaruje najstarszy runtime, na którym potrafi działać. Gdy
+  wydanie wymaga zależności, której zainstalowany runtime nie ma, aktualizacja
+  w miejscu odmawia i odsyła do pełnego instalatora.
+- **`config.json` nigdy nie jest nadpisywany** — to jedyny plik, który mogłeś
+  edytować. Wersję niesie `VERSION.json`. (Konsekwencja dla rozwijających
+  projekt: nowy klucz w `config.json` musi być opcjonalny, z wartością domyślną
+  w kodzie, bo zaktualizowane instalacje zostają przy starym `config.json`.)
+
+Dwa rodzaje instalacji nie dają się zaktualizować w miejscu i mówią to wprost,
+zamiast się wywalać: **AppImage** (jego `src/` to dowiązanie do zamontowanego
+squashfs tylko do odczytu — trzeba pobrać nowy `.AppImage`) oraz **klon gita**
+(tam `git pull`).
+
+Ustawienie `"check_updates": false` w `depthforge_install.json` obok
+zainstalowanej wtyczki wyłącza całość, a `"update_repo": "właściciel/nazwa"`
+kieruje ją na forka albo wewnętrzne lustro. Maszyny bez internetu są
+wspieranym przypadkiem: nieudane sprawdzenie to wpis w logu, nigdy okienko.
 
 ### Dla programistów — ze źródeł
 
@@ -147,8 +188,16 @@ trzeba go zbudować z `--with-models --no-archive`:
 ```bash
 python packaging/build_appimage.py               # → dist/DepthForge-x.y.z-x86_64.AppImage
 python packaging/build_installer.py              # → dist/…-windows-x86_64-setup.exe
+python packaging/build_code_update.py            # → dist/DepthForge-x.y.z-code.zip (+ .sha256)
 python packaging/assets/make_icon.py             # przegenerowanie ikony (jest w repo)
 ```
+
+`build_code_update.py` odstaje od reszty: nie potrzebuje żadnego runtime'u i
+trwa sekundy, ale bez niego wydanie jest niekompletne — zainstalowane kopie
+szukają aktualizacji dokładnie po tej nazwie pliku. Podnoś w nim
+`MIN_RUNTIME_VERSION` zawsze, gdy `requirements.txt` dostaje nową albo nowszą
+zależność, inaczej aktualizacja kodu trafi na runtime, który nie da rady jej
+uruchomić.
 
 `build_installer.py` uruchamia Inno Setup pod wine w kontenerze
 `amake/innosetup`, więc wymaga podmana albo dockera — ale nie wine w systemie.

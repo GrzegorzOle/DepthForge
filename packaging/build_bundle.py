@@ -45,7 +45,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BUNDLE_FILES = Path(__file__).resolve().parent / "bundle_files"
 DIST_DIR = PROJECT_ROOT / "dist"
 
-VERSION = "1.7.1"
+VERSION = "1.8.0"
 
 # python-build-standalone: relocatable CPython, identical layout story on both
 # platforms. Pinned on purpose — "latest" would make builds unreproducible.
@@ -206,6 +206,17 @@ def copy_app(staging: Path, with_models: bool) -> None:
         if src.is_file():
             shutil.copy2(src, app / name)
             log(f"app/{name}")
+
+    # The version the plugin's updater reads, and the only version marker it
+    # rewrites. config.json also carries one, but that file is the user's to
+    # edit (device, model paths), so an in-place code update must not touch it —
+    # which means it cannot be the value that advances.
+    (app / "VERSION.json").write_text(
+        json.dumps({"name": "DepthForge", "version": VERSION,
+                    "source": "bundle"}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    log("app/VERSION.json")
 
     if with_models:
         for rel in MODEL_FILES:
