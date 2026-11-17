@@ -30,7 +30,11 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest: when -latest moved to 26.04, wine inside the
+    # amake/innosetup image (unchanged digest) stopped starting - wineserver
+    # died with "socket: Function not implemented" and the .exe step failed
+    # before anything was uploaded. 24.04 is what v1.8.0 was built on.
+    runs-on: ubuntu-24.04
     timeout-minutes: 180
 
     steps:
