@@ -70,8 +70,8 @@ the [Releases page](https://github.com/GrzegorzOle/DepthForge/releases/latest):
 
 | Platform | Download | Install | Models |
 |---|---|---|---|
-| Windows 10/11 64-bit | `DepthForge-1.8.0-windows-x86_64-setup.exe` | run it | included |
-| Linux x86_64 (glibc 2.28+) | `DepthForge-1.8.0-x86_64.AppImage` | `chmod +x` then run it | included |
+| Windows 10/11 64-bit | `DepthForge-1.9.0-windows-x86_64-setup.exe` | run it | included |
+| Linux x86_64 (glibc 2.28+) | `DepthForge-1.9.0-x86_64.AppImage` | `chmod +x` then run it | included |
 | Either, without the models | `…-linux-x86_64.tar.gz` / `…-windows-x86_64.zip` | `./install.sh` / `install.bat` | downloaded on install |
 
 The first two are **offline** packages: they carry the OpenVINO models (~686 MB)
@@ -233,6 +233,47 @@ python src/depth_pipeline.py \
     --fill-holes \
     --width-mm 200 --relief-mm 7 --mesh-px 200
 ```
+
+### Layered relief — planes you can feel (recommended for scenes)
+
+Raw depth is the wrong thing to print for touch. In *Indian Summer* the meadow
+rising from the horizon to the bottom edge uses ~88 % of the relief height, and
+the dog sitting on the grass is exactly as far away as the grass beside it — so
+it prints ~0.3 mm above it, which a fingertip cannot find. `--tactile-layered`
+prints what touch needs instead: how far each object rises above what it stands on.
+
+```bash
+python src/depth_pipeline.py \
+    --input data/Indian_summer_-_Google_Art_Project.jpg \
+    --output-dir output/indian_summer_layered \
+    --tactile-layered --width-mm 200          # relief 7 mm, 400 px mesh by default
+```
+
+- the ground (or back wall) is estimated and subtracted; it keeps only a gentle slope;
+- every object becomes its own plane with a steep, palpable wall (the dog: ~3 mm);
+- the object's own shape and folds stay inside it; the sky and ground get no texture;
+- large regions (> 35 % of the image, e.g. a whole interior) are searched again
+  inside, so a figure in front of a curtain gets a level of its own.
+
+Automatic segmentation follows the depth model and can merge or miss things
+(a thin staff, a hand lying on the ground). For full control pass hand-drawn
+plane masks — `1` is the foreground (highest), white = inside:
+
+```bash
+    --tactile-layered --plane-mask 1=figure.png --plane-mask 2=dog.png
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--tactile-layered` | off | Layered relief; implies `--tactile` and replaces fill-holes / detail overlay / multiscale / levels |
+| `--plane-mask N=FILE` | — | Plane mask (repeatable); none = automatic segmentation |
+| `--layered-threshold` | `0.035` | How far above the ground a region must rise to be an object |
+| `--layered-detail` | `0.08` | Detail inside objects (folds, limb contours); `0` = smooth planes |
+| `--stl-smooth` | `0.03` | Edge-preserving STL smoothing (all modes): flattens undulation below this fraction of the relief, keeps walls; `0` = off |
+
+The STL is now built from the floating-point map (no 256-level contour lines on
+gentle slopes), split along the surface instead of across it, and is a closed,
+outward-oriented solid.
 
 ### Batch processing
 

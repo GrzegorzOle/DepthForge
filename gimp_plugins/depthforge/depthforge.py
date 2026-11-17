@@ -608,6 +608,61 @@ def _write_png_rgb(path: str, width: int, height: int, rgb_bytes: bytes):
                  + chunk(b"IEND", b""))
 
 
+def _write_png_gray(path: str, width: int, height: int, gray_bytes: bytes):
+    """8-bit grayscale PNG (color type 0) – same stdlib-only writer as above."""
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + tag + data +
+                struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+    raw_rows = b"".join(b"\x00" + gray_bytes[y * width:(y + 1) * width]
+                        for y in range(height))
+    with open(path, "wb") as fh:
+        fh.write(b"\x89PNG\r\n\x1a\n"
+                 + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0))
+                 + chunk(b"IDAT", zlib.compress(raw_rows, 6))
+                 + chunk(b"IEND", b""))
+
+
+def _plane_number(name: str):
+    """'plan 1' / 'Plan2' / 'plane 3 – pies' → 1 / 2 / 3; inne nazwy → None."""
+    import re
+    m = re.match(r"\s*plane?\s*(\d+)", name or "", re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+def _export_plane_masks(image, w: int, h: int, out_dir: str) -> list:
+    """
+    Zapisuje kanały obrazu nazwane „plan N" jako maski PNG dla reliefu
+    warstwowego.  Konwencja jak w malarstwie: plan 1 = pierwszy plan
+    (najbliżej, najwyżej na wydruku).  Kanał tworzy się z zaznaczenia przez
+    Zaznaczenie → Zapisz do kanału i zmianę nazwy.
+
+    Kanał nazwany „plan …", którego nie da się odczytać, to błąd – użytkownik
+    świadomie wskazał plany, więc cicha segmentacja automatyczna zamiast nich
+    byłaby wynikiem, o który nie prosił.
+    """
+    planes = []
+    for ch in image.get_channels():
+        n = _plane_number(ch.get_name())
+        if n is None:
+            continue
+        try:
+            buf = ch.get_buffer()
+            data = buf.get(Gegl.Rectangle.new(0, 0, w, h), 1.0, "Y u8",
+                           Gegl.AbyssPolicy.CLAMP)
+            data = bytes(data)
+            if len(data) != w * h:
+                raise ValueError(f"oczekiwano {w * h} bajtów, odczytano {len(data)}")
+        except Exception as e:
+            raise RuntimeError(
+                f"Nie można odczytać kanału '{ch.get_name()}' jako maski planu: {e}\n"
+                f"Zmień nazwę kanału (żeby nie zaczynała się od 'plan'), aby użyć "
+                f"wykrywania automatycznego.")
+        path = os.path.join(out_dir, f"plane_{len(planes)}.png")
+        _write_png_gray(path, w, h, data)
+        planes.append({"plan": n, "path": path, "name": ch.get_name()})
+    return planes
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  External helper script  (runs inside project .venv)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -618,6 +673,8 @@ _HELPER_SCRIPT = r"""
 #   Visual:    postprocess_depth (CLAHE + Gaussian)
 #   Tactile:   fill_holes → detail_overlay → multiscale_smooth (v9 presets)
 #   Advanced:  jak taktylny, ale ze wszystkimi parametrami z argv
+#   Layered:   relief warstwowy – grunt odjęty, obiekty jako płaszczyzny
+#              (build_layered_relief), opcjonalnie z maskami planów z GIMP-a
 import sys, os
 
 input_png         = sys.argv[1]
@@ -635,6 +692,8 @@ fine_sigma        = float(sys.argv[12])            if len(sys.argv) > 12 else 1.
 limb_sigma        = float(sys.argv[13])            if len(sys.argv) > 13 else 3.0
 fill_holes        = sys.argv[14].lower() == "true" if len(sys.argv) > 14 else True
 tactile_levels    = int(sys.argv[15])              if len(sys.argv) > 15 else 0
+layered_mode      = sys.argv[16].lower() == "true" if len(sys.argv) > 16 else False
+masks_json        = sys.argv[17]                   if len(sys.argv) > 17 else ""
 
 # ── Make DepthForge importable ────────────────────────────────────────────────
 if project_root:
@@ -665,6 +724,7 @@ if img is None:
 clahe_clip = enhancement / 25.0   # 0→0.0, 50→2.0, 100→4.0
 
 depth_u8 = None
+stl_src  = None   # float mapa wysokości dla STL; None → STL z depth_u8
 
 # ── 1. Pełny pipeline: Standard + MiDaS OV + DPT OV + ensemble ───────────────
 try:
@@ -735,7 +795,33 @@ try:
         print(f"  Pojedynczy model: {key}", flush=True)
 
     # ── Post-processing ───────────────────────────────────────────────────────
-    if not tactile_mode and not advanced_mode:
+    if layered_mode:
+        # === RELIEF WARSTWOWY =================================================
+        # Grunt odjęty, każdy obiekt jako płaszczyzna z wyczuwalną ścianą.
+        # Baza: najlepszy pojedynczy model (DPT), bez składnika luminancyjnego.
+        from depth_pipeline import (pick_layered_base, build_layered_relief,
+                                    load_plane_masks)
+        import json
+        base, base_name = pick_layered_base(depth_maps_f32, fused)
+        planes = []
+        if masks_json and os.path.isfile(masks_json):
+            with open(masks_json, encoding="utf-8") as fh:
+                specs = [(p["plan"], p["path"]) for p in json.load(fh)]
+            planes = load_plane_masks(specs, base.shape)
+        report = []
+        relief = build_layered_relief(base, img, plane_masks=planes, report=report)
+        print(f"  Tryb: RELIEF WARSTWOWY (baza: {base_name}, "
+              + (f"maski planów: {len(planes)})" if planes else "wykrywanie automatyczne)"),
+              flush=True)
+        for line in report:
+            print(f"    {line}", flush=True)
+        if not report:
+            print("    żaden obiekt nie wystaje ponad grunt – drukowany jest sam spadek gruntu",
+                  flush=True)
+        depth_u8 = (relief * 255).astype(np.uint8)
+        stl_src = relief
+
+    elif not tactile_mode and not advanced_mode:
         # === TRYB WIZUALNY ====================================================
         print("  Tryb: WIZUALNY (CLAHE + Gaussian)", flush=True)
         depth_u8 = postprocess_depth(fused, clahe_clip=clahe_clip, sigma=0.7)
@@ -801,6 +887,8 @@ try:
 
         # Krok 5: postprocess bez CLAHE
         depth_u8 = postprocess_depth(fused, clahe_clip=0.0, sigma=0.0)
+        # STL z mapy float: 256 poziomów uint8 drukuje się jako poziomice
+        stl_src = normalize_f32_robust(fused) ** 1.02
 
     print("  Pipeline OK", flush=True)
 
@@ -812,6 +900,7 @@ except Exception as e:
 
 # ── 2. Fallback: syntetyczny estymator ────────────────────────────────────────
 if depth_u8 is None:
+    stl_src = None
     print("Fallback: syntetyczny estymator głębi", flush=True)
     gray  = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
     edges = np.abs(cv2.Laplacian(gray, cv2.CV_32F))
@@ -852,7 +941,20 @@ if color_out_png:
 if stl_out_path:
     try:
         from depth_pipeline import depth_to_stl
-        depth_to_stl(depth_u8, stl_out_path)
+        if stl_src is not None:
+            src = stl_src
+            if src.shape[:2] != (h, w):
+                src = cv2.resize(src, (w, h), interpolation=cv2.INTER_LINEAR)
+            if layered_mode:
+                # Płaszczyzny potrzebują ostrych ścian: komórka 0,5 mm przy
+                # 200 mm; 7 mm reliefu to norma tyflograficzna.
+                depth_to_stl(src, stl_out_path, relief_mm=7.0, max_px=400,
+                             invert_depth=invert)
+            else:
+                depth_to_stl(src, stl_out_path, invert_depth=invert)
+        else:
+            # depth_u8 ma już zastosowaną inwersję
+            depth_to_stl(depth_u8, stl_out_path)
         print(f"STL_OK:{stl_out_path}", flush=True)
     except Exception as e:
         import traceback
@@ -1171,6 +1273,17 @@ class DepthForgePlugin(Gimp.PlugIn):
             "Wyłącz dla trybu wizualnego z CLAHE.",
             False, GObject.ParamFlags.READWRITE,
         )
+        procedure.add_boolean_argument(
+            "layered-relief", "Relief _warstwowy (plany – zalecany do druku dotykowego)",
+            "Odejmuje grunt i podnosi każdy obiekt (postać, zwierzę) jako osobną "
+            "płaszczyznę z wyczuwalną krawędzią – zamiast surowej głębi, w której "
+            "obiekt stojący na ziemi ma tę samą wysokość co ziemia obok. "
+            "Ma pierwszeństwo przed trybem taktylnym v9. "
+            "Plany można wskazać ręcznie: kanały o nazwach 'plan 1' (pierwszy plan, "
+            "najwyżej), 'plan 2', … – biały = należy do planu. Bez kanałów obiekty "
+            "są wykrywane automatycznie.",
+            False, GObject.ParamFlags.READWRITE,
+        )
         # ── Tryb zaawansowany – ręczna kontrola wszystkich parametrów ─────────
         procedure.add_boolean_argument(
             "advanced-mode", "Tryb _zaawansowany (parametry ręczne)",
@@ -1407,8 +1520,9 @@ class DepthForgePlugin(Gimp.PlugIn):
         limb_sigma        = config.get_property("limb-sigma")
         fill_holes        = config.get_property("fill-holes")
         tactile_levels    = config.get_property("tactile-levels")
+        layered_relief    = config.get_property("layered-relief")
 
-        _log(f"params: enhancement={enhancement} invert={invert_depth} "
+        _log(f"params: layered={layered_relief} enhancement={enhancement} invert={invert_depth} "
              f"color={color_depth_layer} stl={export_stl} tactile={tactile_mode} "
              f"advanced={advanced_mode} detail_str={detail_strength} "
              f"detail_blur={detail_blur_sigma} fine_s={fine_sigma} "
@@ -1598,6 +1712,19 @@ class DepthForgePlugin(Gimp.PlugIn):
             with open(tmp_helper, "w", encoding="utf-8") as fh:
                 fh.write(_HELPER_SCRIPT)
 
+            # Maski planów (kanały „plan N") – tylko dla reliefu warstwowego.
+            # Zapisywane w prywatnym katalogu helpera, sprzątane razem z nim.
+            masks_json = ""
+            if layered_relief:
+                planes = _export_plane_masks(image, w, h, tmp_helper_dir)
+                if planes:
+                    masks_json = os.path.join(tmp_helper_dir, "plane_masks.json")
+                    with open(masks_json, "w", encoding="utf-8") as fh:
+                        _json.dump(planes, fh)
+                    _log(f"Plane masks: {[(p['plan'], p['name']) for p in planes]}")
+                else:
+                    _log("Plane masks: none – automatic object segmentation")
+
             # 3. Call external Python
             project_root = _find_project_root() or ""
             cmd = [
@@ -1616,6 +1743,8 @@ class DepthForgePlugin(Gimp.PlugIn):
                 str(limb_sigma),
                 str(fill_holes).lower(),
                 str(tactile_levels),
+                str(layered_relief).lower(),
+                masks_json,
             ]
             _log(f"Subprocess cmd: {' '.join(cmd[:3])} ...")
             result = subprocess.run(cmd, capture_output=True, text=True,

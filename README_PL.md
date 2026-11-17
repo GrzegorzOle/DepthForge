@@ -72,8 +72,8 @@ wcześniej. Wybierz jeden plik ze
 
 | Platforma | Plik do pobrania | Instalacja | Modele |
 |---|---|---|---|
-| Windows 10/11 64-bit | `DepthForge-1.8.0-windows-x86_64-setup.exe` | uruchom | w środku |
-| Linux x86_64 (glibc 2.28+) | `DepthForge-1.8.0-x86_64.AppImage` | `chmod +x` i uruchom | w środku |
+| Windows 10/11 64-bit | `DepthForge-1.9.0-windows-x86_64-setup.exe` | uruchom | w środku |
+| Linux x86_64 (glibc 2.28+) | `DepthForge-1.9.0-x86_64.AppImage` | `chmod +x` i uruchom | w środku |
 | Dowolna, bez modeli | `…-linux-x86_64.tar.gz` / `…-windows-x86_64.zip` | `./install.sh` / `install.bat` | pobierane przy instalacji |
 
 Dwa pierwsze to pakiety **offline** — niosą modele OpenVINO (~686 MB) w środku,
@@ -235,6 +235,47 @@ python src/depth_pipeline.py \
     --fill-holes \
     --width-mm 200 --relief-mm 7 --mesh-px 200
 ```
+
+### Relief warstwowy — plany wyczuwalne palcem (zalecany dla scen)
+
+Surowa głębia to zła rzecz do druku dotykowego. W *Babim lecie* łąka wznosząca
+się od horyzontu do dolnej krawędzi zabiera ~88 % wysokości reliefu, a pies
+siedzący na trawie jest dokładnie tak daleko jak trawa obok — więc drukuje się
+~0,3 mm nad nią, czego palec nie znajdzie. `--tactile-layered` drukuje to, czego
+potrzebuje dotyk: o ile każdy obiekt wystaje ponad to, na czym stoi.
+
+```bash
+python src/depth_pipeline.py \
+    --input data/Indian_summer_-_Google_Art_Project.jpg \
+    --output-dir output/indian_summer_layered \
+    --tactile-layered --width-mm 200          # domyślnie relief 7 mm, siatka 400 px
+```
+
+- grunt (albo tylna ściana) jest szacowany i odejmowany; zostaje z niego łagodny spadek;
+- każdy obiekt staje się osobną płaszczyzną ze stromą, wyczuwalną ścianą (pies: ~3 mm);
+- kształt i fałdy obiektu zostają w jego wnętrzu; niebo i grunt nie dostają faktury;
+- duże obszary (> 35 % obrazu, np. całe wnętrze) są przeszukiwane ponownie od
+  środka, więc postać na tle zasłony dostaje własny, wyższy poziom.
+
+Segmentacja automatyczna idzie za modelem głębi i potrafi coś zlać albo pominąć
+(cienki kij, dłoń leżąca na ziemi). Pełną kontrolę dają ręcznie narysowane maski
+planów — `1` to pierwszy plan (najwyżej), biały = wewnątrz:
+
+```bash
+    --tactile-layered --plane-mask 1=postac.png --plane-mask 2=pies.png
+```
+
+| Opcja | Domyślnie | Opis |
+|---|---|---|
+| `--tactile-layered` | wył. | Relief warstwowy; włącza `--tactile` i zastępuje fill-holes / nakładkę detalu / multiscale / poziomy |
+| `--plane-mask N=PLIK` | — | Maska planu (można powtarzać); brak = segmentacja automatyczna |
+| `--layered-threshold` | `0.035` | O ile obszar musi wystawać nad grunt, by był obiektem |
+| `--layered-detail` | `0.08` | Detal wewnątrz obiektów (fałdy, kontury kończyn); `0` = gładkie płaszczyzny |
+| `--stl-smooth` | `0.03` | Wygładzanie STL zachowujące krawędzie (wszystkie tryby): spłaszcza falowanie poniżej tego ułamka reliefu, zostawia ściany; `0` = wył. |
+
+STL jest teraz budowany z mapy zmiennoprzecinkowej (bez poziomic z 256 poziomów
+na łagodnych spadkach), dzielony wzdłuż powierzchni zamiast w poprzek i jest
+zamkniętą bryłą o normalnych skierowanych na zewnątrz.
 
 ### Przetwarzanie wsadowe
 

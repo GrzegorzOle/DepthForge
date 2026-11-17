@@ -79,6 +79,27 @@ Biblioteki `gi` (GObject Introspection) są dostarczane razem z GIMP 3.x –
 
 4. Kliknij **OK** – mapa głębi pojawi się jako nowa warstwa **Depth Map (DepthForge)**.
 
+### Relief warstwowy i maski planów (druk dotykowy)
+
+Opcja **Relief warstwowy (plany)** odejmuje grunt i podnosi każdy obiekt jako
+osobną płaszczyznę z wyczuwalną krawędzią. Ma pierwszeństwo przed trybem
+taktylnym v9. Eksport STL w tym trybie: relief 7 mm, siatka 400 px.
+
+Bez dodatkowych kroków obiekty są wykrywane automatycznie. Żeby wskazać plany
+ręcznie (pewniejsze, zwłaszcza we wnętrzach):
+
+1. Zaznacz obiekt dowolnym narzędziem zaznaczania.
+2. **Zaznaczenie → Zapisz do kanału**.
+3. W oknie **Kanały** zmień nazwę kanału na `plan 1` (pierwszy plan – najwyżej),
+   `plan 2` (drugi plan) itd. Kilka kanałów może mieć ten sam numer;
+   dopisek po numerze jest dozwolony (`plan 2 pies`).
+4. Uruchom DepthForge z zaznaczonym reliefem warstwowym. Wszystko poza
+   kanałami to tło.
+
+Kanały o innych nazwach są ignorowane. Kanał nazwany `plan …`, którego nie da
+się odczytać, przerywa działanie z komunikatem zamiast po cichu przejść na
+wykrywanie automatyczne.
+
 ---
 
 ## Jak działa generowanie mapy głębi

@@ -716,8 +716,408 @@ def smooth_quantized_boundaries(quantized_f32: np.ndarray,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  LAYERED RELIEF  –  plany jako płaszczyzny zamiast surowej głębi
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Dlaczego surowa głębia nie nadaje się do dotyku (zmierzone na „Babim lecie"
+# Chełmońskiego, DPT + MiDaS, relief 7 mm):
+#   • pochyły grunt od horyzontu do dolnej krawędzi zjada ~88 % wysokości –
+#     palce czytają rampę, a postać jest na niej łagodnym garbem;
+#   • pies siedzi na trawie w tej samej odległości co trawa obok, więc ma tę
+#     samą „głębię": 15 vs 15/11 na 100, czyli ~0,3 mm – niewyczuwalne;
+#   • kwantyzacja percentylowa tnie ten pochyły grunt na poziome pasy
+#     (poziomice), a nie na obiekty.
+#
+# Dotyk potrzebuje czegoś innego: o ile obiekt wystaje ponad to, na czym stoi.
+# Dlatego: (1) szacujemy powierzchnię gruntu/tła, (2) odejmujemy ją, (3) to, co
+# wystaje, staje się obiektem z własną płaszczyzną i stromą, wyczuwalną ścianą,
+# (4) grunt dostaje tylko łagodny spadek.  Bazą jest najlepsza pojedyncza mapa
+# z modelu (DPT), bez syntetycznego składnika luminancyjnego, który wiąże
+# wysokość z jasnością (czarny pies → dół) i nakłada fakturę trawy na cały grunt.
+
+def _normalized_blur(values: np.ndarray, weights: np.ndarray,
+                     sigma_yx: tuple) -> tuple:
+    """Rozmycie gaussowskie liczone tylko z pikseli o wadze > 0 (normalized convolution)."""
+    num = gaussian_filter(values * weights, sigma_yx, mode="nearest")
+    den = gaussian_filter(weights, sigma_yx, mode="nearest")
+    return num, den
+
+
+def estimate_ground_surface(depth_f32: np.ndarray,
+                            threshold:  float = 0.035,
+                            exclude:    np.ndarray | None = None,
+                            region:     np.ndarray | None = None,
+                            work_px:    int   = 512,
+                            iterations: int   = 4,
+                            sigma_frac: tuple = (0.015, 0.25)) -> np.ndarray:
+    """
+    Szacuje powierzchnię gruntu/tła, na której „stoją" obiekty sceny.
+
+    Grunt na obrazie zmienia głębię głównie z wysokością w kadrze (bliżej
+    widza = niżej w kadrze), a powoli w poziomie.  Dlatego rozmycie jest
+    anizotropowe: wąskie w pionie (σy ≈ 1,5 % wysokości – śledzi stromy
+    pionowy gradient), szerokie w poziomie (σx ≈ 25 % szerokości – przeskakuje
+    pod dużymi obiektami, interpolując grunt z boków).  Iteracyjnie wyklucza
+    piksele, które wystają ponad bieżące oszacowanie (obiekty), więc postać
+    zajmująca 85 % szerokości wiersza nie podnosi gruntu w tym wierszu.
+
+    Start z niskiego (5.) percentyla wierszy: w wierszach zdominowanych przez
+    postać wyższy percentyl trafiłby w postać i spłaszczył jej dolną część.
+
+    Args:
+        depth_f32:  Mapa głębi [0, 1], jasne = blisko.
+        threshold:  Próg wystawania nad grunt (ułamek zakresu głębi).
+        exclude:    Opcjonalna maska pikseli na pewno niebędących gruntem
+                    (np. maski planów z GIMP-a).
+        region:     Opcjonalna maska obszaru, w którym szukamy gruntu (poziom
+                    zagnieżdżony: tło *wewnątrz* dużego obiektu).  Piksele spoza
+                    niej nie wpływają na wynik.
+        work_px:    Dłuższy bok mapy roboczej (obliczenia w zmniejszeniu).
+        iterations: Liczba iteracji wykluczania obiektów.
+        sigma_frac: (σy, σx) rozmycia jako ułamek wysokości/szerokości.  Domyślne
+                    (wąsko w pionie, szeroko w poziomie) opisują grunt; tło we
+                    wnętrzu (ściana, zasłona) zmienia się podobnie w obu
+                    kierunkach, więc poziom zagnieżdżony używa izotropowego.
+
+    Returns:
+        float32 mapa gruntu w rozdzielczości wejścia.
+    """
+    from scipy.ndimage import binary_dilation
+
+    H, W = depth_f32.shape
+    s  = work_px / max(H, W)
+    sw = max(8, int(round(W * s)))
+    sh = max(8, int(round(H * s)))
+
+    def shrink_mask(m):
+        return cv2.resize(m.astype(np.uint8), (sw, sh),
+                          interpolation=cv2.INTER_NEAREST) > 0
+
+    small = cv2.resize(depth_f32.astype(np.float32), (sw, sh),
+                       interpolation=cv2.INTER_AREA)
+    valid = shrink_mask(region) if region is not None else np.ones((sh, sw), bool)
+    if exclude is not None:
+        valid &= ~shrink_mask(exclude)
+    if not valid.any():
+        return np.zeros((H, W), dtype=np.float32)
+    sy, sx = max(1.0, sh * sigma_frac[0]), max(2.0, sw * sigma_frac[1])
+
+    # Start: 5. percentyl każdego wiersza (tylko piksele obszaru); wiersze bez
+    # pikseli obszaru dostają wartość interpolowaną z sąsiednich wierszy.
+    rows = np.full(sh, np.nan, dtype=np.float32)
+    for y in range(sh):
+        v = small[y, valid[y]]
+        if v.size:
+            rows[y] = np.percentile(v, 5)
+    have = ~np.isnan(rows)
+    rows = np.interp(np.arange(sh), np.flatnonzero(have), rows[have]).astype(np.float32)
+    ground = np.repeat(gaussian_filter(rows, sy)[:, None], sw, axis=1)
+
+    dil = np.ones((5, 5), dtype=bool)
+    for it in range(iterations):
+        # Pierwsza iteracja z wyższym progiem: start z 5. percentyla zaniża
+        # grunt, więc niski próg wziąłby trawę za obiekt.
+        thr = threshold * (2.0 if it == 0 else 1.0)
+        obj = binary_dilation((small - ground) > thr, structure=dil)
+        w = (valid & ~obj).astype(np.float32)
+        if not w.any():
+            break
+        num, den = _normalized_blur(small, w, (sy, sx))
+        ground = np.where(den > 1e-3, num / np.maximum(den, 1e-6), ground)
+    return cv2.resize(ground.astype(np.float32), (W, H),
+                      interpolation=cv2.INTER_LINEAR)
+
+
+def load_plane_masks(specs, shape: tuple) -> list:
+    """
+    Wczytuje maski planów: lista napisów „N=ścieżka.png" (CLI) albo krotek
+    (N, ścieżka).  N to numer planu w polskiej terminologii malarskiej:
+    1 = pierwszy plan (najbliżej widza, najwyżej na wydruku), 2 = drugi plan…
+    Biały (> 127) = należy do planu.  Kilka masek może mieć ten sam numer.
+
+    Returns:
+        lista (N, maska bool o kształcie `shape`)
+    """
+    out = []
+    for spec in specs or []:
+        if isinstance(spec, str):
+            if "=" not in spec:
+                raise ValueError(f"Maska planu musi mieć postać N=plik.png, dostałem: {spec}")
+            num_s, path = spec.split("=", 1)
+            num = int(num_s)
+        else:
+            num, path = spec
+        buf = np.frombuffer(open(path, "rb").read(), dtype=np.uint8)
+        m = cv2.imdecode(buf, cv2.IMREAD_GRAYSCALE)
+        if m is None:
+            raise ValueError(f"Nie można wczytać maski planu: {path}")
+        if m.shape != shape:
+            m = cv2.resize(m, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
+        mask = m > 127
+        if mask.any():
+            out.append((int(num), mask))
+    return out
+
+
+def pick_layered_base(depth_maps_f32: dict, fused_f32: np.ndarray) -> tuple:
+    """
+    Wybiera mapę bazową dla reliefu warstwowego: najlepszy pojedynczy model
+    (DPT > MiDaS), a dopiero bez modeli – fuzję.  Syntetyczny składnik jest
+    pomijany celowo: to odwrócona luminancja, która na obrazach daje fakturę
+    pędzla i wiąże wysokość z jasnością.
+
+    Returns:
+        (mapa float32 [0, 1] w rozmiarze fuzji, nazwa źródła)
+    """
+    for key in ("dpt", "midas"):
+        m = depth_maps_f32.get(key)
+        if m is not None:
+            m = m.astype(np.float32)
+            if m.shape != fused_f32.shape:
+                m = cv2.resize(m, (fused_f32.shape[1], fused_f32.shape[0]),
+                               interpolation=cv2.INTER_CUBIC)
+            return normalize_f32_robust(m), key
+    return normalize_f32_robust(fused_f32), "ensemble"
+
+
+def _segment_relief_objects(d: np.ndarray,
+                            ground: np.ndarray,
+                            region: np.ndarray | None,
+                            threshold: float,
+                            min_area_frac: float,
+                            peak_factor: float,
+                            image_area: int) -> list:
+    """
+    Spójne obszary wystające ponad `ground` o więcej niż `threshold`.
+    Zwraca listę (maska, pole, 90. percentyl wystawania).  Odrzuca obszary
+    małe oraz płaskie (90. percentyl < peak_factor·threshold) – to szerokie
+    płaty gruntu, który tylko trochę odstaje od modelu, a nie obiekty.
+    """
+    from scipy.ndimage import (binary_opening, binary_fill_holes, label,
+                               labeled_comprehension)
+    from scipy.ndimage import sum as nd_sum
+
+    H, W = d.shape
+    resid = gaussian_filter(np.clip(d - ground, 0, None), max(1.0, max(H, W) / 1000))
+    mask = resid > threshold
+    if region is not None:
+        mask &= region
+    mask = binary_fill_holes(binary_opening(mask, iterations=max(1, int(round(max(H, W) / 600)))))
+    lab, n = label(mask)
+    out = []
+    if not n:
+        return out
+    idx = np.arange(1, n + 1)
+    areas = nd_sum(mask, lab, idx)
+    peaks = labeled_comprehension(resid, lab, idx, lambda v: np.percentile(v, 90),
+                                  np.float32, 0)
+    for i, a, p in zip(idx, areas, peaks):
+        if a >= min_area_frac * image_area and p >= peak_factor * threshold:
+            out.append((lab == i, int(a), float(p)))
+    return out
+
+
+def build_layered_relief(depth_f32: np.ndarray,
+                         image_bgr:       np.ndarray | None = None,
+                         plane_masks:     list | None = None,
+                         threshold:       float = 0.035,
+                         min_area_frac:   float = 0.002,
+                         peak_factor:     float = 2.5,
+                         nest_frac:       float = 0.35,
+                         ground_span:     float = 0.20,
+                         plateau_base:    float = 0.30,
+                         level_step:      float = 0.25,
+                         nearness_span:   float = 0.15,
+                         interior_gain:   float = 0.30,
+                         dome_gain:       float = 0.25,
+                         dome_radius:     float = 0.04,
+                         detail_strength: float = 0.08,
+                         detail_scale:    float = 1.0 / 400,
+                         work_px:         int   = 2048,
+                         report:          list | None = None) -> np.ndarray:
+    """
+    Buduje relief warstwowy do druku dotykowego: grunt jako łagodny spadek,
+    każdy obiekt jako osobna płaszczyzna ze stromą ścianą i własnym, ściśniętym
+    kształtem wewnętrznym.
+
+    Wysokości (ułamek reliefu; na końcu skalowane tak, by maksimum = 1):
+      • niebo / najdalszy grunt   0
+      • grunt                     0 … ground_span       (łagodny spadek ku widzowi)
+      • obiekt poziomu L          plateau_base + level_step·(L−1)
+                                  + nearness_span·bliskość gruntu pod obiektem
+      • wnętrze obiektu           + interior_gain · kształt z mapy głębi
+      • zaokrąglenie              + dome_gain · parabola t(2−t) od konturu
+                                  (promień ≤ dome_radius dłuższego boku)
+      • detal (tylko w obiektach) ± detail_strength     (fałdy, kontury kończyn)
+
+    Obiekty: z masek planów (gdy podane – wskazane przez człowieka, plan 1 =
+    pierwszy plan = najwyżej) albo z automatycznej segmentacji.  Segmentacja
+    jest zagnieżdżona: obszar większy niż `nest_frac` obrazu to raczej ściana,
+    zasłona albo całe wnętrze niż postać (we wnętrzach najdalszy w wierszu
+    jest zwykle otwór okna, więc wszystko inne „wystaje").  Wtedy grunt jest
+    szacowany ponownie *wewnątrz* tego obszaru, a to, co wystaje dalej
+    (postać na tle zasłony), dostaje poziom wyżej.  Głębokość zagnieżdżenia: 2.
+
+    Detal z luminancji jest pasmowo-przepustowy i liczony WYŁĄCZNIE z pikseli
+    obiektów (normalized convolution): inaczej jasna trawa wokół czarnego psa
+    przesuwa średnią i wciska psa w dół.  Skala pasma to ułamek dłuższego boku
+    obrazu, więc jest fizyczna na wydruku (1/400 ≈ 0,5 mm przy 200 mm).
+
+    Obliczenia biegną w rozdzielczości co najwyżej `work_px` (dłuższy bok);
+    wynik jest skalowany z powrotem.  Siatka STL ma i tak ≤ 512 px.
+
+    Args:
+        depth_f32:     Mapa bazowa [0, 1], jasne = blisko (pick_layered_base).
+        image_bgr:     Oryginał BGR do detalu; None = bez detalu.
+        plane_masks:   Wynik load_plane_masks(); None/[] = segmentacja automatyczna.
+        report:        Opcjonalna lista, do której trafiają opisy obiektów.
+
+    Returns:
+        float32 [0, 1] – mapa wysokości gotowa do depth_to_stl() (bez kwantyzacji
+        do uint8: na łagodnym gruncie 256 poziomów drukuje się jako poziomice).
+    """
+    from scipy.ndimage import distance_transform_edt
+
+    full_h, full_w = depth_f32.shape
+    scale = min(1.0, work_px / max(full_h, full_w))
+    H, W = max(8, int(round(full_h * scale))), max(8, int(round(full_w * scale)))
+
+    def to_work(a, interp):
+        return a if a.shape == (H, W) else cv2.resize(a, (W, H), interpolation=interp)
+
+    d = normalize_f32_robust(to_work(depth_f32.astype(np.float32), cv2.INTER_AREA))
+    image_area = H * W
+
+    masks = [(n, to_work(m.astype(np.uint8), cv2.INTER_NEAREST) > 0)
+             for n, m in (plane_masks or [])]
+    exclude = None
+    if masks:
+        exclude = np.zeros((H, W), dtype=bool)
+        for _, m in masks:
+            exclude |= m
+    ground = estimate_ground_surface(d, threshold=threshold, exclude=exclude)
+    g_lo, g_hi = np.percentile(ground, [1, 99])
+    g_norm = np.clip((ground - g_lo) / max(g_hi - g_lo, 1e-6), 0, 1)
+
+    height = (ground_span * g_norm).astype(np.float32)
+    objects = []    # (maska, wysokość płaszczyzny, opis)
+
+    if masks:
+        nums = sorted({n for n, _ in masks})
+        for n, m in masks:
+            rank = nums.index(n)                         # 0 = plan 1 = najbliżej
+            level = len(nums) - rank                     # plan 1 → najwyższy poziom
+            objects.append((m, plateau_base + level_step * (level - 1),
+                            f"plan {n}: {int(m.sum())} px"))
+    else:
+        def descend(region, region_ground, level):
+            for m, area, peak in _segment_relief_objects(
+                    d, region_ground, region, threshold, min_area_frac,
+                    peak_factor, image_area):
+                near = float(g_norm[m].mean())
+                plateau = plateau_base + level_step * (level - 1) + nearness_span * near
+                objects.append((m, plateau,
+                                f"poziom {level}: {100 * area / image_area:.1f} % obrazu, "
+                                f"wystaje {peak:.2f}, bliskość {near:.2f}"))
+                if level < 2 and area > nest_frac * image_area:
+                    inner_ground = estimate_ground_surface(d, threshold=threshold, region=m,
+                                                          sigma_frac=(0.06, 0.06))
+                    descend(m, inner_ground, level + 1)
+        descend(None, ground, 1)
+
+    # Kształt wewnętrzny: głębia w obrębie obiektu, wspólna skala dla wszystkich
+    # obiektów – mały, płaski pies nie dostaje rozciągniętego szumu.  Obiekty
+    # zagnieżdżone są na liście po rodzicu, więc nadpisują go (np.maximum).
+    ranges = [float(np.percentile(d[m], 98) - np.percentile(d[m], 2))
+              for m, _, _ in objects if m.any()]
+    span = max(ranges) if ranges else 1.0
+    for m, plateau, desc in objects:
+        if not m.any():
+            continue
+        base = float(np.percentile(d[m], 2))
+        inner = np.clip((d - base) / max(span, 1e-6), 0, 1)
+        # Zaokrąglenie: parabola t(2−t) od konturu do promienia R.  Obiekt ma
+        # być wypukły pod palcem – płaska płyta ze ścianą czyta się jak taca,
+        # a mapa głębi czarnej sylwetki bywa płaska.  R ≤ 4 % dłuższego boku
+        # (≈ 8 mm przy 200 mm), więc wielka zasłona dostaje tylko zaokrąglony
+        # brzeg, a nie poduszkę na pół obrazu.
+        dt = distance_transform_edt(m)
+        R = max(1.0, min(float(np.percentile(dt[m], 95)), max(H, W) * dome_radius))
+        t = np.clip(dt / R, 0, 1)
+        dome = t * (2.0 - t)
+        top = plateau + interior_gain * inner + dome_gain * dome
+        height = np.where(m, np.maximum(height, top), height)
+        if report is not None:
+            report.append(f"{desc}, płaszczyzna {plateau:.2f}")
+
+    if image_bgr is not None and detail_strength > 0 and objects:
+        obj = np.zeros((H, W), dtype=bool)
+        for m, _, _ in objects:
+            obj |= m
+        # Detal wygasa ku konturowi i nie bierze z niego próbek: maska nigdy
+        # nie leży idealnie na sylwetce, a piksele z jej brzegu to zwykle tło
+        # (jasne niebo za czarnym psem) albo futro pod światło.  Liczone wprost
+        # podnosiły obwódkę o ~0,6 mm ponad środek – wierzch wyglądał jak taca.
+        edge = max(1.0, max(H, W) / 120)
+        feather = np.clip(distance_transform_edt(obj) / edge, 0, 1).astype(np.float32)
+        feather = feather * feather * (3 - 2 * feather)          # smoothstep
+        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        gray = to_work(gray, cv2.INTER_AREA)
+        sg = max(1.0, max(H, W) * detail_scale)
+        n1, d1 = _normalized_blur(gray, feather, (sg, sg))
+        n2, d2 = _normalized_blur(gray, feather, (sg * 8, sg * 8))
+        band = n1 / np.maximum(d1, 1e-6) - n2 / np.maximum(d2, 1e-6)
+        inside = feather > 0.5
+        band = band / (float(np.std(band[inside])) + 1e-6) if inside.any() else band * 0
+        height = height + np.clip(band * detail_strength, -0.15, 0.15) * feather
+
+    height = median_filter(height, size=5)
+    height = gaussian_filter(height, max(1.0, max(H, W) / 700))
+    height = np.clip(height, 0, None)
+    height = height / max(float(height.max()), 1e-6)
+    if (H, W) != (full_h, full_w):
+        height = cv2.resize(height, (full_w, full_h), interpolation=cv2.INTER_CUBIC)
+    return np.clip(height, 0, 1).astype(np.float32)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  STL GENERATOR
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _height_to_unit_float(depth: np.ndarray) -> np.ndarray:
+    """uint8 / uint16 / float → float32 [0, 1] bez utraty precyzji."""
+    if depth.dtype == np.uint8:
+        return depth.astype(np.float32) / 255.0
+    if depth.dtype == np.uint16:
+        return depth.astype(np.float32) / 65535.0
+    return np.clip(depth.astype(np.float32), 0.0, 1.0)
+
+
+def smooth_surface_for_print(height_f32: np.ndarray,
+                             strength: float = 0.03,
+                             radius_px: int = 2) -> np.ndarray:
+    """
+    Wygładzanie zachowujące krawędzie, na siatce STL (filtr bilateralny).
+
+    Wygładza drobne falowanie, którego amplituda jest mniejsza od `strength`
+    (ułamek reliefu; 0,03 przy 7 mm ≈ 0,2 mm): szum mapy, pozostałości faktury.
+    Uskoki większe od niego – ściany planów, kontury postaci – zostają strome,
+    bo filtr nie uśrednia pikseli o bardzo różnej wysokości.
+
+    Args:
+        height_f32: Mapa wysokości [0, 1] w rozdzielczości siatki.
+        strength:   Próg „to jeszcze szum" w jednostkach [0, 1]; 0 = wyłączone.
+        radius_px:  Promień przestrzenny w komórkach siatki.
+    """
+    if strength <= 0:
+        return height_f32
+    out = height_f32.astype(np.float32)
+    for _ in range(2):   # dwa łagodne przejścia gładzą lepiej niż jedno silne
+        out = cv2.bilateralFilter(out, d=2 * radius_px + 1,
+                                  sigmaColor=float(strength),
+                                  sigmaSpace=float(radius_px))
+    return out
+
 
 def depth_to_stl(depth_u8: np.ndarray,
                  output_path: str,
@@ -727,14 +1127,27 @@ def depth_to_stl(depth_u8: np.ndarray,
                  max_px:       int   = 512,
                  invert_depth: bool  = False,
                  flip_x:       bool  = False,
-                 flip_y:       bool  = True) -> None:
+                 flip_y:       bool  = True,
+                 smooth:       float = 0.03) -> None:
     """
-    Converts a depth map to a binary STL file (watertight) for 3D printing.
+    Converts a height map to a binary, watertight STL for 3D printing.
 
     The model consists of:
-      • Top surface (relief) – triangle mesh with height from the depth map
-      • Flat base plate
-      • Four side walls closing the solid
+      • Top surface (relief) – triangle mesh with height from the map
+      • Four side walls and a bottom closing the solid
+
+    Surface quality (what used to read as "dense, jagged triangles"):
+      • float input is used as-is – a uint8 map has only 256 heights, which on
+        a gentle slope prints as visible contour lines (0.03 mm terraces);
+      • downscaling uses area averaging, not Lanczos, whose overshoot left a
+        ripple along every steep wall;
+      • each grid quad is split along the diagonal that follows the surface
+        (the pair of corners with the closer heights), so diagonal contours
+        do not zigzag;
+      • smooth_surface_for_print() removes sub-threshold undulation while
+        keeping walls steep.
+    All faces are oriented outwards and the bottom is a fan sharing every
+    perimeter vertex of the walls (no T-junctions), so the mesh is closed.
 
     Physical dimensions:
       • Width:  width_mm  [mm]
@@ -742,25 +1155,28 @@ def depth_to_stl(depth_u8: np.ndarray,
       • Height: base_mm + relief_mm [mm]
 
     Args:
-        depth_u8:     Depth map uint8 [0-255]
+        depth_u8:     Height map: uint8 [0-255], uint16 [0-65535] or float [0, 1]
+                      (float preferred – no quantisation)
         output_path:  Output path (.stl)
         width_mm:     Model width [mm]
         relief_mm:    Maximum relief height above base [mm]
         base_mm:      Base plate thickness [mm]
         max_px:       Maximum mesh resolution (longer side) [px]
-        invert_depth: Invert depth values (255-depth)
+        invert_depth: Invert heights
         flip_x:       Horizontal mirror
         flip_y:       Vertical mirror (default True –
                       corrects image→Prusa Slicer Y orientation)
+        smooth:       Edge-preserving smoothing threshold (fraction of relief;
+                      0 = off).  See smooth_surface_for_print().
     """
-    # ── Orientation transforms ────────────────────────────────────────────────
-    d = depth_u8.copy()
+    d = _height_to_unit_float(depth_u8)
     if invert_depth:
-        d = 255 - d
+        d = 1.0 - d
     if flip_x:
         d = np.fliplr(d)
     if flip_y:
         d = np.flipud(d)
+    d = np.ascontiguousarray(d)
 
     # ── Mesh scaling ──────────────────────────────────────────────────────────
     orig_h, orig_w = d.shape
@@ -768,112 +1184,77 @@ def depth_to_stl(depth_u8: np.ndarray,
         scale = max_px / max(orig_h, orig_w)
         new_w = max(2, int(orig_w * scale))
         new_h = max(2, int(orig_h * scale))
-        depth_scaled = cv2.resize(d, (new_w, new_h),
-                                  interpolation=cv2.INTER_LANCZOS4)
-    else:
-        new_w, new_h  = orig_w, orig_h
-        depth_scaled  = d
+        d = cv2.resize(d, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    rows, cols = d.shape
+    d = np.clip(smooth_surface_for_print(d, strength=smooth), 0.0, 1.0)
 
-    # ── Convert px → mm ───────────────────────────────────────────────────────
-    height_mm = width_mm * new_h / new_w          # depth [mm]
-    px_to_mm_x = width_mm  / (new_w - 1)
-    px_to_mm_y = height_mm / (new_h - 1)
+    height_mm  = width_mm * rows / cols
+    px_to_mm_x = width_mm  / (cols - 1)
+    px_to_mm_y = height_mm / (rows - 1)
 
-    depth_norm = depth_scaled.astype(np.float32) / 255.0  # [0, 1]
+    xs = np.arange(cols, dtype=np.float32) * px_to_mm_x
+    ys = np.arange(rows, dtype=np.float32) * px_to_mm_y
+    Z  = (base_mm + d * relief_mm).astype(np.float32)
 
-    logger.info(f"STL mesh: {new_w}×{new_h} px  →  "
-                f"{width_mm:.1f}×{height_mm:.1f}×{base_mm + relief_mm:.1f} mm  "
-                f"({2*(new_w-1)*(new_h-1)} top triangles + 12 side faces)")
+    logger.info(f"STL mesh: {cols}×{rows} px  →  "
+                f"{width_mm:.1f}×{height_mm:.1f}×{base_mm + relief_mm:.1f} mm")
 
     # ── Top surface ───────────────────────────────────────────────────────────
-    rows, cols = new_h, new_w
+    X, Y = np.meshgrid(xs, ys)
+    top = np.stack([X, Y, Z], axis=-1)                     # (rows, cols, 3)
+    a = top[:-1, :-1].reshape(-1, 3)                       # (c,   r)
+    b = top[:-1, 1:].reshape(-1, 3)                        # (c+1, r)
+    c = top[1:, :-1].reshape(-1, 3)                        # (c,   r+1)
+    e = top[1:, 1:].reshape(-1, 3)                         # (c+1, r+1)
+    # Split along the diagonal whose end heights are closer – it follows the
+    # ridge/valley instead of cutting across it.
+    use_ad = (np.abs(a[:, 2] - e[:, 2]) < np.abs(b[:, 2] - c[:, 2]))[:, None, None]
+    t1 = np.where(use_ad, np.stack([a, b, e], 1), np.stack([a, b, c], 1))
+    t2 = np.where(use_ad, np.stack([a, e, c], 1), np.stack([b, e, c], 1))
+    parts = [t1, t2]                                        # both +z
 
-    def vtx(c, r):
-        """Mesh vertex coordinates [mm]."""
-        return (
-            c * px_to_mm_x,
-            r * px_to_mm_y,
-            base_mm + depth_norm[r, c] * relief_mm,
-        )
+    # ── Walls ─────────────────────────────────────────────────────────────────
+    def wall(tops: np.ndarray, outward: np.ndarray) -> np.ndarray:
+        bots = tops.copy()
+        bots[:, 2] = 0.0
+        p, q = tops[:-1], tops[1:]
+        pb, qb = bots[:-1], bots[1:]
+        tri = np.concatenate([np.stack([p, q, pb], 1), np.stack([pb, q, qb], 1)])
+        return _orient(tri, outward)
 
-    n_top = 2 * (rows - 1) * (cols - 1)
+    parts.append(wall(top[:, 0],  np.array([-1, 0, 0], np.float32)))   # left
+    parts.append(wall(top[:, -1], np.array([ 1, 0, 0], np.float32)))   # right
+    parts.append(wall(top[0, :],  np.array([0, -1, 0], np.float32)))   # front
+    parts.append(wall(top[-1, :], np.array([0,  1, 0], np.float32)))   # back
 
-    # ── Side and bottom triangles (watertight) ────────────────────────────────
-    # Each side wall: left, right, front, back (strip of triangles)
-    # Bottom: 2 triangles
+    # ── Bottom: fan from the centre over every perimeter edge ─────────────────
+    perim = np.concatenate([top[0, :], top[1:, -1], top[-1, -2::-1], top[-2:0:-1, 0]])
+    perim = perim.copy()
+    perim[:, 2] = 0.0
+    nxt = np.roll(perim, -1, axis=0)
+    centre = np.broadcast_to(np.array([xs[-1] / 2, ys[-1] / 2, 0.0], np.float32),
+                             perim.shape)
+    bottom = np.stack([centre, perim, nxt], 1)
+    parts.append(_orient(bottom, np.array([0, 0, -1], np.float32)))
 
-    n_side_left  = 2 * (rows - 1)
-    n_side_right = 2 * (rows - 1)
-    n_side_front = 2 * (cols - 1)
-    n_side_back  = 2 * (cols - 1)
-    n_bottom     = 2
-
-    n_total = n_top + n_side_left + n_side_right + n_side_front + n_side_back + n_bottom
-
-    all_triangles = np.zeros(n_total, dtype=stl_mesh.Mesh.dtype)
-    idx = 0
-
-    # -- Top surface ----------------------------------------------------------
-    for r in range(rows - 1):
-        for c in range(cols - 1):
-            v00 = vtx(c,     r    )
-            v10 = vtx(c + 1, r    )
-            v01 = vtx(c,     r + 1)
-            v11 = vtx(c + 1, r + 1)
-
-            # Triangle A
-            all_triangles['vectors'][idx] = [v00, v10, v01]
-            idx += 1
-            # Triangle B
-            all_triangles['vectors'][idx] = [v10, v11, v01]
-            idx += 1
-
-    # Helper: bottom (z = 0) at corners
-    def bot(c, r):
-        return (c * px_to_mm_x, r * px_to_mm_y, 0.0)
-
-    # -- Left wall (c = 0) ----------------------------------------------------
-    for r in range(rows - 1):
-        t = vtx(0, r);    t1 = vtx(0, r + 1)
-        b = bot(0, r);    b1 = bot(0, r + 1)
-        all_triangles['vectors'][idx] = [t, b, t1];   idx += 1
-        all_triangles['vectors'][idx] = [b, b1, t1];  idx += 1
-
-    # -- Right wall (c = cols-1) ----------------------------------------------
-    for r in range(rows - 1):
-        t = vtx(cols - 1, r);    t1 = vtx(cols - 1, r + 1)
-        b = bot(cols - 1, r);    b1 = bot(cols - 1, r + 1)
-        all_triangles['vectors'][idx] = [t, t1, b];   idx += 1
-        all_triangles['vectors'][idx] = [b, t1, b1];  idx += 1
-
-    # -- Front wall (r = 0) ---------------------------------------------------
-    for c in range(cols - 1):
-        t = vtx(c, 0);    t1 = vtx(c + 1, 0)
-        b = bot(c, 0);    b1 = bot(c + 1, 0)
-        all_triangles['vectors'][idx] = [t, t1, b];   idx += 1
-        all_triangles['vectors'][idx] = [b, t1, b1];  idx += 1
-
-    # -- Back wall (r = rows-1) -----------------------------------------------
-    for c in range(cols - 1):
-        t = vtx(c, rows - 1);    t1 = vtx(c + 1, rows - 1)
-        b = bot(c, rows - 1);    b1 = bot(c + 1, rows - 1)
-        all_triangles['vectors'][idx] = [t, b, t1];   idx += 1
-        all_triangles['vectors'][idx] = [b, b1, t1];  idx += 1
-
-    # -- Bottom ---------------------------------------------------------------
-    bl = bot(0,        0       )
-    br = bot(cols - 1, 0       )
-    fl = bot(0,        rows - 1)
-    fr = bot(cols - 1, rows - 1)
-    all_triangles['vectors'][idx] = [bl, br, fl];  idx += 1
-    all_triangles['vectors'][idx] = [br, fr, fl];  idx += 1
-
-    # ── Compute normals and save ──────────────────────────────────────────────
+    tris = np.concatenate(parts).astype(np.float32)
+    all_triangles = np.zeros(len(tris), dtype=stl_mesh.Mesh.dtype)
+    all_triangles['vectors'] = tris
     m = stl_mesh.Mesh(all_triangles)
     m.update_normals()
     m.save(output_path, mode=StlMode.BINARY)
     size_mb = Path(output_path).stat().st_size / (1024 * 1024)
-    logger.info(f"STL saved: {output_path}  ({size_mb:.1f} MB, {n_total} triangles)")
+    logger.info(f"STL saved: {output_path}  ({size_mb:.1f} MB, {len(tris)} triangles)")
+
+
+def _orient(tris: np.ndarray, outward: np.ndarray) -> np.ndarray:
+    """Flips triangles whose winding normal points against `outward`."""
+    n = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
+    flip = (n @ outward) < 0
+    out = tris.copy()
+    out[flip, 1], out[flip, 2] = tris[flip, 2], tris[flip, 1]
+    # Degenerate wall triangles (zero height at an edge) are harmless; keep them.
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -907,7 +1288,12 @@ def run_pipeline(input_path: str,
                  fill_holes:               bool  = False,
                  fill_holes_min_area:      int   = 20,
                  fill_holes_max_area:      int   = 2000,
-                 fill_holes_kernel:        int   = 5) -> None:
+                 fill_holes_kernel:        int   = 5,
+                 tactile_layered:          bool  = False,
+                 plane_masks:              list | None = None,
+                 layered_threshold:        float = 0.035,
+                 layered_detail:           float = 0.08,
+                 stl_smooth:               float = 0.03) -> None:
     """
     Runs the full pipeline:
       image → 3× depth map → fusion → (detail overlay OR tactile smoothing) → STL
@@ -964,7 +1350,23 @@ def run_pipeline(input_path: str,
         fill_holes_min_area:       Minimum contour area [px²] to consider (default 20).
         fill_holes_max_area:       Maximum contour area [px²] to consider (default 2000).
         fill_holes_kernel:         Morphological kernel size for contour closing (default 5).
+        tactile_layered:           Layered relief for touch (build_layered_relief):
+                                   ground removed, every object a raised plane with
+                                   a palpable wall.  Implies tactile; replaces
+                                   fill_holes / detail overlay / multiscale /
+                                   quantization, which act on raw depth.
+        plane_masks:               ["N=mask.png", ...] – plane masks for layered
+                                   relief (1 = foreground, highest).  None = automatic
+                                   object segmentation.
+        layered_threshold:         How far above the ground a region must rise to be
+                                   an object (fraction of depth range, default 0.035).
+        layered_detail:            Amplitude of luminance detail inside objects
+                                   (folds, limb contours; 0 = off, default 0.08).
+        stl_smooth:                Edge-preserving smoothing on the STL grid
+                                   (fraction of relief; 0 = off, default 0.03).
     """
+    if tactile_layered:
+        tactile = True
     img_path = Path(input_path)
     if not img_path.exists():
         raise FileNotFoundError(f"File not found: {input_path}")
@@ -1075,7 +1477,8 @@ def run_pipeline(input_path: str,
     # Modele DPT/MiDaS przy małych obiektach (pies, daleka postać) wykrywają
     # tylko kontur, a wnętrze jest płaskie/puste.  fill_small_object_holes()
     # podnosi wnętrze do poziomu 75. percentyla pikseli brzegowych.
-    if fill_holes:
+    stl_source = None   # float height map for STL; None → use the uint8 ensemble
+    if fill_holes and not tactile_layered:
         t_fh = time.perf_counter()
         fused_f32 = fill_small_object_holes(
             fused_f32,
@@ -1087,7 +1490,33 @@ def run_pipeline(input_path: str,
         print(f"    fill_small_object_holes: area {fill_holes_min_area}–"
               f"{fill_holes_max_area} px², kernel={fill_holes_kernel}  "
               f"({ms_fh:.0f} ms)")
-    if tactile:
+    if tactile_layered:
+        # ── LAYERED RELIEF PATH ───────────────────────────────────────────────
+        print(f"\n  {'─'*64}")
+        print(f"  Layered relief (planes for touch)…")
+        t_lay = time.perf_counter()
+        base_f32, base_name = pick_layered_base(depth_maps_f32, fused_f32)
+        masks = load_plane_masks(plane_masks, base_f32.shape) if plane_masks else []
+        report: list = []
+        relief_f32 = build_layered_relief(base_f32, image,
+                                          plane_masks     = masks,
+                                          threshold       = layered_threshold,
+                                          detail_strength = layered_detail,
+                                          report          = report)
+        print(f"    base map: {base_name}   "
+              + (f"plane masks: {len(masks)}" if masks else "automatic segmentation"))
+        for line in report:
+            print(f"    {line}")
+        if not report:
+            print("    no object rises above the ground – only the ground slope is printed")
+        relief_u16 = (relief_f32 * 65535).astype(np.uint16)
+        cv2.imwrite(str(out_dir / f"{stem}_relief_layered.png"), relief_u16)
+        print(f"  ✓ Layered relief built ({(time.perf_counter() - t_lay) * 1000:.0f} ms)")
+        fused_f32  = relief_f32
+        stl_source = relief_f32
+        clahe_clip = 0.0
+        smooth_sigma = 0.0
+    elif tactile:
         # ── TACTILE PATH ──────────────────────────────────────────────────────
         # Kolejność kroków:
         #   1. (opcjonalnie) detail_overlay – wyciąga kontury kończyn z luminancji
@@ -1171,6 +1600,9 @@ def run_pipeline(input_path: str,
               + (f", bg_levels={tactile_bg_levels}, fg_levels={tactile_fg_levels}"
                  if tactile_levels > 1 else "")
               + f", {ms_tact:.0f} ms)")
+        # STL from float, not from the uint8 ensemble: 256 levels print as
+        # contour lines on gentle slopes.  Same tone curve as postprocess_depth.
+        stl_source = normalize_f32_robust(fused_f32) ** 1.02
         # Force CLAHE off – local contrast enhancement has no meaning in touch
         clahe_clip = 0.0
         # Sigma already handled by prepare_for_touch; keep post-process pass minimal
@@ -1226,7 +1658,7 @@ def run_pipeline(input_path: str,
 
     t0 = time.perf_counter()
     stl_path = str(out_dir / f"{stem}_ensemble.stl")
-    depth_to_stl(fused_post,
+    depth_to_stl(stl_source if stl_source is not None else fused_post,
                  stl_path,
                  width_mm     = width_mm,
                  relief_mm    = relief_mm,
@@ -1234,7 +1666,8 @@ def run_pipeline(input_path: str,
                  max_px       = mesh_px,
                  invert_depth = invert_depth,
                  flip_x       = flip_x,
-                 flip_y       = flip_y)
+                 flip_y       = flip_y,
+                 smooth       = stl_smooth)
     t_stl = (time.perf_counter() - t0) * 1000
 
     print(f"  ✓ STL generated  ({t_stl:.0f} ms)")
@@ -1475,6 +1908,25 @@ def main():
                                   "(default 3.0). Final filter uses limb_sigma*0.5 to "
                                   "preserve separation between adjacent legs/arms. "
                                   "Recommended: 2.5–3.5.")
+    tactile_grp.add_argument("--tactile-layered", action="store_true", default=False,
+                             help="Layered relief for touch: subtract the ground, raise every "
+                                  "object as its own plane with a palpable wall. Implies "
+                                  "--tactile and replaces --fill-holes / --detail-* / "
+                                  "--tactile-multiscale / --tactile-levels. Recommended for "
+                                  "scenes where figures stand on a receding ground.")
+    tactile_grp.add_argument("--plane-mask", action="append", default=None, metavar="N=FILE",
+                             help="Plane mask for --tactile-layered (repeatable). N: 1 = "
+                                  "foreground (highest), 2 = middle ground, … White = inside. "
+                                  "Without masks objects are segmented automatically.")
+    tactile_grp.add_argument("--layered-threshold", type=float, default=0.035,
+                             help="How far above the ground a region must rise to count as an "
+                                  "object (fraction of depth range). Lower = more, smaller objects.")
+    tactile_grp.add_argument("--layered-detail", type=float, default=0.08,
+                             help="Luminance detail inside objects only (folds, limb contours); "
+                                  "0 = smooth planes.")
+    parser.add_argument("--stl-smooth", type=float, default=0.03,
+                        help="Edge-preserving smoothing of the STL surface (fraction of relief; "
+                             "smooths undulation below this height, keeps walls; 0 = off)")
 
     # ── Small-object hole filling ─────────────────────────────────────────────
     holes_grp = parser.add_argument_group(
@@ -1497,7 +1949,14 @@ def main():
     # When --tactile is set without explicit mesh-px/relief-mm, apply tactile defaults
     mesh_px   = args.mesh_px
     relief_mm = args.relief_mm
-    if args.tactile:
+    # Sentinel comparison: argparse cannot tell "passed 512" from "passed nothing".
+    if args.tactile_layered:
+        # Planes need crisp walls: 0.5 mm cells at 200 mm.  The low 140 px grid
+        # of the continuous tactile mode was a low-pass for noise this mode no
+        # longer has.
+        if mesh_px   == 512:   mesh_px   = 400
+        if relief_mm == 10.0:  relief_mm = 7.0
+    elif args.tactile:
         if mesh_px   == 512:   mesh_px   = 140
         if relief_mm == 10.0:  relief_mm = 7.0
 
@@ -1530,6 +1989,11 @@ def main():
         fill_holes_min_area      = args.fill_holes_min_area,
         fill_holes_max_area      = args.fill_holes_max_area,
         fill_holes_kernel        = args.fill_holes_kernel,
+        tactile_layered          = args.tactile_layered,
+        plane_masks              = args.plane_mask,
+        layered_threshold        = args.layered_threshold,
+        layered_detail           = args.layered_detail,
+        stl_smooth               = args.stl_smooth,
     )
 
 
