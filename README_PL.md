@@ -72,8 +72,8 @@ wcześniej. Wybierz jeden plik ze
 
 | Platforma | Plik do pobrania | Instalacja | Modele |
 |---|---|---|---|
-| Windows 10/11 64-bit | `DepthForge-1.9.0-windows-x86_64-setup.exe` | uruchom | w środku |
-| Linux x86_64 (glibc 2.28+) | `DepthForge-1.9.0-x86_64.AppImage` | `chmod +x` i uruchom | w środku |
+| Windows 10/11 64-bit | `DepthForge-1.9.1-windows-x86_64-setup.exe` | uruchom | w środku |
+| Linux x86_64 (glibc 2.28+) | `DepthForge-1.9.1-x86_64.AppImage` | `chmod +x` i uruchom | w środku |
 | Dowolna, bez modeli | `…-linux-x86_64.tar.gz` / `…-windows-x86_64.zip` | `./install.sh` / `install.bat` | pobierane przy instalacji |
 
 Dwa pierwsze to pakiety **offline** — niosą modele OpenVINO (~686 MB) w środku,
@@ -252,7 +252,8 @@ python src/depth_pipeline.py \
 ```
 
 - grunt (albo tylna ściana) jest szacowany i odejmowany; zostaje z niego łagodny spadek;
-- każdy obiekt staje się osobną płaszczyzną ze stromą, wyczuwalną ścianą (pies: ~3 mm);
+- każdy obiekt staje się osobną płaszczyzną: wyrasta z trawy na ~4 mm (pies) łagodnym
+  zboczem szerokości ~5 mm zamiast pionowej ściany i ma zaokrąglony wierzch;
 - kształt i fałdy obiektu zostają w jego wnętrzu; niebo i grunt nie dostają faktury;
 - duże obszary (> 35 % obrazu, np. całe wnętrze) są przeszukiwane ponownie od
   środka, więc postać na tle zasłony dostaje własny, wyższy poziom.
@@ -271,7 +272,14 @@ planów — `1` to pierwszy plan (najwyżej), biały = wewnątrz:
 | `--plane-mask N=PLIK` | — | Maska planu (można powtarzać); brak = segmentacja automatyczna |
 | `--layered-threshold` | `0.035` | O ile obszar musi wystawać nad grunt, by był obiektem |
 | `--layered-detail` | `0.08` | Detal wewnątrz obiektów (fałdy, kontury kończyn); `0` = gładkie płaszczyzny |
+| `--layered-edge` | `5.0` | Szerokość (mm) zbocza w miejscu, gdzie obiekt styka się z gruntem, wyśrodkowanego na konturze; `0` = pionowa ściana |
+| `--layered-texture` | `1.0` | Faktury tła (mnożnik): szorstkość trawy rosnąca ku widzowi, wypukłe linie ~1 mm dla patyków i źdźbeł, łagodne kształty chmur na niebie; `0` = gładki grunt i niebo |
 | `--stl-smooth` | `0.03` | Wygładzanie STL zachowujące krawędzie (wszystkie tryby): spłaszcza falowanie poniżej tego ułamka reliefu, zostawia ściany; `0` = wył. |
+
+Faktury tła nie odtwarzają obrazu, tylko kodują obszary dla palca, tak jak
+tyflografia rozróżnia pola fakturą: szorstka ziemia, gładkie niebo z łagodnymi
+chmurami, a leżące na ziemi przedmioty liniowe jako grzbiety. Wygasają wokół
+obiektów i przy brzegu obrazu (skany często łapią krawędź płótna albo ramę).
 
 STL jest teraz budowany z mapy zmiennoprzecinkowej (bez poziomic z 256 poziomów
 na łagodnych spadkach), dzielony wzdłuż powierzchni zamiast w poprzek i jest

@@ -730,7 +730,7 @@ def smooth_quantized_boundaries(quantized_f32: np.ndarray,
 #
 # Dotyk potrzebuje czegoś innego: o ile obiekt wystaje ponad to, na czym stoi.
 # Dlatego: (1) szacujemy powierzchnię gruntu/tła, (2) odejmujemy ją, (3) to, co
-# wystaje, staje się obiektem z własną płaszczyzną i stromą, wyczuwalną ścianą,
+# wystaje, staje się obiektem z własną płaszczyzną i wyczuwalnym brzegiem,
 # (4) grunt dostaje tylko łagodny spadek.  Bazą jest najlepsza pojedyncza mapa
 # z modelu (DPT), bez syntetycznego składnika luminancyjnego, który wiąże
 # wysokość z jasnością (czarny pies → dół) i nakłada fakturę trawy na cały grunt.
@@ -917,6 +917,121 @@ def _segment_relief_objects(d: np.ndarray,
     return out
 
 
+def _ridge_lines(gray: np.ndarray, sigma: float) -> np.ndarray:
+    """
+    Siła wydłużonych linii (jasnych i ciemnych) w skali `sigma`: największa
+    wartość własna Hessjanu minus mniejsza, czyli odpowiedź na kreskę, a nie na
+    plamę.  Normalizowana sigma², więc porównywalna między skalami.
+    """
+    g = gaussian_filter(gray, sigma)
+    gy, gx = np.gradient(g)
+    gyy, gyx = np.gradient(gy)
+    gxy, gxx = np.gradient(gx)
+    tr = gxx + gyy
+    disc = np.sqrt(np.maximum((gxx - gyy) ** 2 + 4 * gxy * gxy, 0))
+    l1, l2 = 0.5 * (tr + disc), 0.5 * (tr - disc)
+    big = np.where(np.abs(l1) > np.abs(l2), l1, l2)
+    small = np.where(np.abs(l1) > np.abs(l2), l2, l1)
+    return (np.abs(big) - np.abs(small)) * sigma * sigma
+
+
+def _surface_texture(gray: np.ndarray,
+                     d: np.ndarray,
+                     g_norm: np.ndarray,
+                     obj: np.ndarray,
+                     grass_amp: float = 0.025,
+                     line_amp: float = 0.07,
+                     cloud_amp: float = 0.04,
+                     report: list | None = None) -> np.ndarray:
+    """
+    Faktury tła reliefu warstwowego (ułamek reliefu, do dodania do wysokości).
+
+    Nie odtwarzają obrazu: kodują obszary dla palca, tak jak tyflografia
+    rozróżnia pola fakturą.  Trzy role:
+      • grunt – drobna szorstkość z pędzla; amplituda rośnie ku widzowi
+        (gradient faktury to sam w sobie sygnał głębi), przy horyzoncie gaśnie;
+      • linie – wydłużone kreski (patyki, źdźbła, sznurek) jako wypukłe
+        grzbiety poszerzone do ~1 mm na wydruku, bo cieńszych palec nie czyta;
+      • niebo – szerokie, łagodne wybrzuszenia jaśniejszych partii (chmury);
+        niebo jest poza tym gładkie, więc odróżnia się od szorstkiej ziemi.
+    Wszystko wygasa przy obiektach: nie dotyka ich ścian ani wierzchu.
+
+    Amplitudy są dobrane do 7 mm reliefu i siatki 0,5 mm: 0,025 ≈ 0,2 mm na
+    odchylenie standardowe (szczyty ~0,5 mm), linie ~0,5 mm, chmury ~0,3 mm.
+    Mniejsze zniknęłyby w smooth_surface_for_print() (próg 0,03 reliefu).
+    """
+    from scipy.ndimage import distance_transform_edt, label
+    from scipy.ndimage import sum as nd_sum
+
+    H, W = gray.shape
+    L = max(H, W)
+
+    def smoothstep(x):
+        x = np.clip(x, 0, 1)
+        return x * x * (3 - 2 * x)
+
+    away = smoothstep(distance_transform_edt(~obj) / max(1.0, L / 120))
+    # Margines przy brzegu obrazu: skany muzealne łapią krawędź płótna albo
+    # ramy.  Ciemny pasek 0,5 % szerokości przy prawym brzegu „Babiego lata"
+    # robił z sąsiedniego nieba 9-milimetrowy pas wyniesiony na maksimum.
+    yy = np.minimum(np.arange(H), np.arange(H)[::-1])[:, None]
+    xx = np.minimum(np.arange(W), np.arange(W)[::-1])[None, :]
+    m0 = L / 200
+    away = away * smoothstep((np.minimum(yy, xx) - m0) / m0)
+    sky = gaussian_filter(((d < 0.01) & (g_norm < 0.01) & ~obj).astype(np.float32), L / 300)
+    sky = smoothstep((sky - 0.2) / 0.6)
+    ground_w = (away * (1 - sky)).astype(np.float32)
+    sky_w = (away * sky).astype(np.float32)
+    out = np.zeros((H, W), np.float32)
+
+    def band(weights, s_fine, s_coarse):
+        n1, d1 = _normalized_blur(gray, weights, (s_fine, s_fine))
+        n2, d2 = _normalized_blur(gray, weights, (s_coarse, s_coarse))
+        return n1 / np.maximum(d1, 1e-6) - n2 / np.maximum(d2, 1e-6)
+
+    # Grunt: pasmo ~0,4–2,5 mm na wydruku 200 mm.
+    if (ground_w > 0.5).sum() > 0.01 * H * W:
+        s = max(1.0, L / 500)
+        b = band(ground_w, s, s * 6)
+        b = np.clip(b / (float(np.std(b[ground_w > 0.5])) + 1e-6), -2.5, 2.5)
+        out += grass_amp * b * (0.3 + 0.7 * g_norm) * ground_w
+
+    # Linie: grzbiety Hessjanu z progiem z histerezą – silne (górne 3 % gruntu)
+    # zaczepiają, słabsze (górne 10 %) dołączają, jeśli się z nimi łączą.
+    # Z samym progiem silnym kij rozpadał się na kreski.
+    if (ground_w > 0.5).sum() > 0.01 * H * W:
+        r = _ridge_lines(gray, max(1.0, L / 700))
+        on = ground_w > 0.5
+        hi_t, lo_t = np.percentile(r[on], [97, 90])
+        weak = (r > lo_t) & on
+        lab, n = label(weak)
+        lines = np.zeros_like(weak)
+        if n:
+            idx = np.arange(1, n + 1)
+            strong = nd_sum((r > hi_t) & weak, lab, idx)
+            sizes = nd_sum(weak, lab, idx)
+            keep = np.zeros(n + 1, bool)
+            keep[1:] = (strong > 0) & (sizes >= max(4, L / 150))   # ≥ ~1,3 mm
+            lines = keep[lab]
+        width = max(1.0, L / 400)                              # ~1 mm szerokości
+        ridge = gaussian_filter(lines.astype(np.float32), width)
+        ridge = smoothstep(ridge / max(float(ridge.max()), 1e-6) * 3)
+        out += line_amp * ridge * ground_w * (0.4 + 0.6 * g_norm)
+        if report is not None:
+            report.append(f"faktura: linie {100 * lines.mean():.1f} % gruntu")
+
+    # Niebo: duże, miękkie formy, jaśniejsze = wyżej.
+    if (sky_w > 0.5).sum() > 0.01 * H * W:
+        s = max(1.0, L / 120)
+        b = band(sky_w, s, s * 5)
+        b = np.clip(b / (float(np.std(b[sky_w > 0.5])) + 1e-6), -2.0, 2.0)
+        b = np.maximum(b, -0.5)
+        b -= float(b[sky_w > 0.5].mean())     # inaczej całe niebo się podnosi: uskok na granicy
+        out += cloud_amp * b * sky_w
+
+    return out
+
+
 def build_layered_relief(depth_f32: np.ndarray,
                          image_bgr:       np.ndarray | None = None,
                          plane_masks:     list | None = None,
@@ -931,14 +1046,18 @@ def build_layered_relief(depth_f32: np.ndarray,
                          interior_gain:   float = 0.30,
                          dome_gain:       float = 0.25,
                          dome_radius:     float = 0.04,
+                         edge_soft:       float = 0.025,
                          detail_strength: float = 0.08,
                          detail_scale:    float = 1.0 / 400,
+                         texture:         float = 1.0,
                          work_px:         int   = 2048,
                          report:          list | None = None) -> np.ndarray:
     """
     Buduje relief warstwowy do druku dotykowego: grunt jako łagodny spadek,
-    każdy obiekt jako osobna płaszczyzna ze stromą ścianą i własnym, ściśniętym
-    kształtem wewnętrznym.
+    każdy obiekt jako osobna płaszczyzna z wyczuwalnym brzegiem i własnym,
+    ściśniętym kształtem wewnętrznym.  Brzeg to łagodne zbocze szerokości
+    edge_soft·dłuższy bok (0,025 ≈ 5 mm przy 200 mm), wyśrodkowane na konturze;
+    edge_soft = 0 daje pionową ścianę.
 
     Wysokości (ułamek reliefu; na końcu skalowane tak, by maksimum = 1):
       • niebo / najdalszy grunt   0
@@ -1046,7 +1165,22 @@ def build_layered_relief(depth_f32: np.ndarray,
         t = np.clip(dt / R, 0, 1)
         dome = t * (2.0 - t)
         top = plateau + interior_gain * inner + dome_gain * dome
-        height = np.where(m, np.maximum(height, top), height)
+        if edge_soft > 0:
+            # Łagodne podejście od gruntu zamiast pionowej ściany: zbocze
+            # szerokości w, wyśrodkowane na konturze (pół na trawie, pół w
+            # obiekcie), styczne do gruntu u dołu i zaokrąglone u góry.  Samo
+            # wewnętrzne zbocze 3 mm przy 4 mm wysokości miało nadal ~55° i
+            # zjadało wąskie części (rękę); wyśrodkowane traci połowę mniej.
+            w = max(1.0, max(H, W) * edge_soft)
+            dt_out, (iy, ix) = distance_transform_edt(~m, return_indices=True)
+            top_ext = np.where(m, top, top[iy, ix])          # wierzch przedłużony poza kontur
+            e = np.clip((dt - dt_out + w / 2) / w, 0, 1)
+            e = e * e * (3 - 2 * e)
+            ramp = height + (top_ext - height) * e
+            zone = m | (dt_out < w / 2)
+            height = np.where(zone, np.maximum(height, ramp), height)
+        else:
+            height = np.where(m, np.maximum(height, top), height)
         if report is not None:
             report.append(f"{desc}, płaszczyzna {plateau:.2f}")
 
@@ -1073,6 +1207,14 @@ def build_layered_relief(depth_f32: np.ndarray,
 
     height = median_filter(height, size=5)
     height = gaussian_filter(height, max(1.0, max(H, W) / 700))
+    if image_bgr is not None and texture > 0:
+        # Po wygładzeniu, nie przed: mediana 5 px zjadłaby źdźbła i patyki.
+        obj = np.zeros((H, W), dtype=bool)
+        for m, _, _ in objects:
+            obj |= m
+        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        height = height + texture * _surface_texture(
+            to_work(gray, cv2.INTER_AREA), d, g_norm, obj, report=report)
     height = np.clip(height, 0, None)
     height = height / max(float(height.max()), 1e-6)
     if (H, W) != (full_h, full_w):
@@ -1293,6 +1435,8 @@ def run_pipeline(input_path: str,
                  plane_masks:              list | None = None,
                  layered_threshold:        float = 0.035,
                  layered_detail:           float = 0.08,
+                 layered_texture:          float = 1.0,
+                 layered_edge_mm:          float = 5.0,
                  stl_smooth:               float = 0.03) -> None:
     """
     Runs the full pipeline:
@@ -1362,6 +1506,12 @@ def run_pipeline(input_path: str,
                                    an object (fraction of depth range, default 0.035).
         layered_detail:            Amplitude of luminance detail inside objects
                                    (folds, limb contours; 0 = off, default 0.08).
+        layered_edge_mm:           Width of the slope where an object meets the
+                                   ground, centred on the contour, in print mm
+                                   (0 = vertical wall, default 5).
+        layered_texture:           Background textures – grass roughness, linear
+                                   features (sticks, stalks), soft clouds; a
+                                   multiplier (0 = smooth ground and sky, default 1).
         stl_smooth:                Edge-preserving smoothing on the STL grid
                                    (fraction of relief; 0 = off, default 0.03).
     """
@@ -1502,6 +1652,8 @@ def run_pipeline(input_path: str,
                                           plane_masks     = masks,
                                           threshold       = layered_threshold,
                                           detail_strength = layered_detail,
+                                          texture         = layered_texture,
+                                          edge_soft       = max(0.0, layered_edge_mm) / max(width_mm, 1e-6),
                                           report          = report)
         print(f"    base map: {base_name}   "
               + (f"plane masks: {len(masks)}" if masks else "automatic segmentation"))
@@ -1924,6 +2076,13 @@ def main():
     tactile_grp.add_argument("--layered-detail", type=float, default=0.08,
                              help="Luminance detail inside objects only (folds, limb contours); "
                                   "0 = smooth planes.")
+    tactile_grp.add_argument("--layered-edge", type=float, default=5.0,
+                             help="Width in mm of the slope where an object meets the ground, "
+                                  "centred on the contour; 0 = vertical wall.")
+    tactile_grp.add_argument("--layered-texture", type=float, default=1.0,
+                             help="Background textures: grass roughness growing towards the "
+                                  "viewer, raised lines for sticks and stalks, soft clouds. "
+                                  "Multiplier; 0 = smooth ground and sky.")
     parser.add_argument("--stl-smooth", type=float, default=0.03,
                         help="Edge-preserving smoothing of the STL surface (fraction of relief; "
                              "smooths undulation below this height, keeps walls; 0 = off)")
@@ -1993,6 +2152,8 @@ def main():
         plane_masks              = args.plane_mask,
         layered_threshold        = args.layered_threshold,
         layered_detail           = args.layered_detail,
+        layered_texture          = args.layered_texture,
+        layered_edge_mm          = args.layered_edge,
         stl_smooth               = args.stl_smooth,
     )
 

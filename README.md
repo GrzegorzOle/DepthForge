@@ -70,8 +70,8 @@ the [Releases page](https://github.com/GrzegorzOle/DepthForge/releases/latest):
 
 | Platform | Download | Install | Models |
 |---|---|---|---|
-| Windows 10/11 64-bit | `DepthForge-1.9.0-windows-x86_64-setup.exe` | run it | included |
-| Linux x86_64 (glibc 2.28+) | `DepthForge-1.9.0-x86_64.AppImage` | `chmod +x` then run it | included |
+| Windows 10/11 64-bit | `DepthForge-1.9.1-windows-x86_64-setup.exe` | run it | included |
+| Linux x86_64 (glibc 2.28+) | `DepthForge-1.9.1-x86_64.AppImage` | `chmod +x` then run it | included |
 | Either, without the models | `…-linux-x86_64.tar.gz` / `…-windows-x86_64.zip` | `./install.sh` / `install.bat` | downloaded on install |
 
 The first two are **offline** packages: they carry the OpenVINO models (~686 MB)
@@ -250,7 +250,8 @@ python src/depth_pipeline.py \
 ```
 
 - the ground (or back wall) is estimated and subtracted; it keeps only a gentle slope;
-- every object becomes its own plane with a steep, palpable wall (the dog: ~3 mm);
+- every object becomes its own plane, rising ~4 mm (the dog) from the grass along a
+  gentle ~5 mm slope instead of a vertical wall, with a domed top;
 - the object's own shape and folds stay inside it; the sky and ground get no texture;
 - large regions (> 35 % of the image, e.g. a whole interior) are searched again
   inside, so a figure in front of a curtain gets a level of its own.
@@ -269,7 +270,15 @@ plane masks — `1` is the foreground (highest), white = inside:
 | `--plane-mask N=FILE` | — | Plane mask (repeatable); none = automatic segmentation |
 | `--layered-threshold` | `0.035` | How far above the ground a region must rise to be an object |
 | `--layered-detail` | `0.08` | Detail inside objects (folds, limb contours); `0` = smooth planes |
+| `--layered-edge` | `5.0` | Width (mm) of the slope where an object meets the ground, centred on the contour; `0` = vertical wall |
+| `--layered-texture` | `1.0` | Background textures (multiplier): grass roughness growing towards the viewer, raised ~1 mm lines for sticks and stalks, soft cloud shapes in the sky; `0` = smooth ground and sky |
 | `--stl-smooth` | `0.03` | Edge-preserving STL smoothing (all modes): flattens undulation below this fraction of the relief, keeps walls; `0` = off |
+
+The background textures do not reproduce the painting; they code areas for the
+fingertip, the way tactile graphics separate fields by texture: rough ground,
+smooth sky with gentle clouds, and linear objects lying on the ground as ridges.
+They fade out around objects and along the image border (scans often catch the
+canvas edge or the frame).
 
 The STL is now built from the floating-point map (no 256-level contour lines on
 gentle slopes), split along the surface instead of across it, and is a closed,

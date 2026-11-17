@@ -1,7 +1,7 @@
 {
     "project": {
         "name": "DepthForge",
-        "version": "1.9.0",
+        "version": "1.9.1",
         "description": "Depth map generation for museum images to create 3D tactile visualizations for the visually impaired"
     },
     "directories": {

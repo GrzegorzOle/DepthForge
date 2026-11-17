@@ -82,8 +82,13 @@ Biblioteki `gi` (GObject Introspection) są dostarczane razem z GIMP 3.x –
 ### Relief warstwowy i maski planów (druk dotykowy)
 
 Opcja **Relief warstwowy (plany)** odejmuje grunt i podnosi każdy obiekt jako
-osobną płaszczyznę z wyczuwalną krawędzią. Ma pierwszeństwo przed trybem
+osobną płaszczyznę z wyczuwalną krawędzią: obiekt wyrasta z gruntu łagodnym
+zboczem szerokości ok. 5 mm i ma zaokrąglony wierzch. Ma pierwszeństwo przed trybem
 taktylnym v9. Eksport STL w tym trybie: relief 7 mm, siatka 400 px.
+
+Tło dostaje faktury do rozróżniania palcem: szorstką trawę (mocniejszą na
+pierwszym planie), wypukłe linie patyków i źdźbeł oraz łagodne chmury na
+gładkim niebie. Obiekty i brzeg obrazu zostają bez faktury.
 
 Bez dodatkowych kroków obiekty są wykrywane automatycznie. Żeby wskazać plany
 ręcznie (pewniejsze, zwłaszcza we wnętrzach):
